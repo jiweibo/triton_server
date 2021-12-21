@@ -151,6 +151,31 @@ def np_to_torch_dtype(np_dtype):
         return None  # Not supported in Torch
 
 
+def np_to_paddle_dtype(np_dtype):
+    if np_dtype == bool:
+        return paddle.bool
+    elif np_dtype == np.int8:
+        return paddle.int8
+    elif np_dtype == np.int16:
+        return paddle.int16
+    elif np_dtype == np.int32:
+        return paddle.int32
+    elif np_dtype == np.int64:
+        return paddle.int64
+    elif np_dtype == np.uint8:
+        return paddle.uint8
+    elif np_dtype == np.uint16:
+        return None  # Not supported in Paddle
+    elif np_dtype == np.float16:
+        return paddle.float16
+    elif np_dtype == np.float32:
+        return paddle.float32
+    elif np_dtype == np.float64:
+        return paddle.float64
+    elif np_dtype == np_dtype_string:
+        return None  # Not supported in Paddle
+
+
 def create_tf_modelfile(create_savedmodel, models_dir, model_version, io_cnt,
                         max_batch, dtype, shape):
 
@@ -464,6 +489,121 @@ def create_libtorch_modelconfig(create_savedmodel, models_dir, model_version,
     config = '''
 name: "{}"
 platform: "pytorch_libtorch"
+max_batch_size: {}
+version_policy: {}
+'''.format(model_name, max_batch, version_policy_str)
+
+    for io_num in range(io_cnt):
+        config += '''
+input [
+  {{
+    name: "INPUT__{}"
+    data_type: {}
+    dims: [ {} ]
+  }}
+]
+output [
+  {{
+    name: "OUTPUT__{}"
+    data_type: {}
+    dims: [ {} ]
+  }}
+]
+'''.format(io_num, np_to_model_dtype(dtype), shape_str, io_num,
+           np_to_model_dtype(dtype), shape_str)
+
+    try:
+        os.makedirs(config_dir)
+    except OSError as ex:
+        pass  # ignore existing dir
+
+    with open(config_dir + "/config.pbtxt", "w") as cfile:
+        cfile.write(config)
+
+
+def create_paddle_modelfile(create_savedmodel, models_dir, model_version,
+                              io_cnt, max_batch, dtype, shape):
+    if not tu.validate_for_paddle_model(dtype, dtype, dtype, shape, shape, shape):
+        return
+    
+    paddle_dtype = np_to_paddle_dtype(dtype)
+
+    model_name = tu.get_zero_model_name(
+        "paddle_nobatch" if max_batch == 0 else "paddle", io_cnt, dtype)
+
+    # Create the model
+    if io_cnt == 1:
+        class IdentityNet(nn.Layer):
+
+            def __init__(self):
+                super(IdentityNet, self).__init__()
+
+            def forward(self, input0):
+                return input0
+    elif io_cnt == 2:
+
+        class IdentityNet(nn.Layer):
+
+            def __init__(self):
+                super(IdentityNet, self).__init__()
+
+            def forward(self, input0, input1):
+                return input0, input1
+    elif io_cnt == 3:
+
+        class IdentityNet(nn.Layer):
+
+            def __init__(self):
+                super(IdentityNet, self).__init__()
+
+            def forward(self, input0, input1, input2):
+                return input0, input1, input2
+    elif io_cnt == 4:
+
+        class IdentityNet(nn.Layer):
+
+            def __init__(self):
+                super(IdentityNet, self).__init__()
+
+            def forward(self, input0, input1, input2, input3):
+                return input0, input1, input2, input3
+
+    identityModel = IdentityNet()
+    example_inputs = [
+        InputSpec(shape, dtype=paddle_dtype, name="x_"+str(i)) for i in range(io_cnt)
+    ]
+    net = to_static(identityModel,
+                    input_spec=example_inputs)
+
+
+    model_version_dir = models_dir + "/" + model_name + "/" + str(model_version)
+
+    try:
+        os.makedirs(model_version_dir)
+    except OSError as ex:
+        pass  # ignore existing dir
+
+    paddle.jit.save(net, model_version_dir + "/model")
+
+
+def create_paddle_modelconfig(create_savedmodel, models_dir, model_version,
+                                io_cnt, max_batch, dtype, shape):
+    if not tu.validate_for_paddle_model(dtype, dtype, dtype, shape, shape,
+                                        shape):
+        return
+
+    # Unpack version policy
+    version_policy_str = "{ latest { num_versions: 1 }}"
+
+    # Use a different model name for the non-batching variant
+    model_name = tu.get_zero_model_name(
+        "paddle_nobatch" if max_batch == 0 else "paddle", io_cnt, dtype)
+    shape_str = tu.shape_to_dims_str(shape)
+
+    config_dir = models_dir + "/" + model_name
+    config = '''
+name: "{}"
+platform: "paddle"
 max_batch_size: {}
 version_policy: {}
 '''.format(model_name, max_batch, version_policy_str)
@@ -1030,6 +1170,15 @@ def create_models(models_dir, dtype, shape, io_cnt=1, no_batch=True):
             create_libtorch_modelfile(True, models_dir, model_version, io_cnt,
                                       0, dtype, shape)
 
+    if FLAGS.paddle:
+        create_paddle_modelconfig(True, models_dir, model_version, io_cnt, 8, dtype, shape)
+        create_paddle_modelfile(True, models_dir, model_version, io_cnt, 8, dtype, shape)
+        if no_batch:
+            create_paddle_modelconfig(True, models_dir, model_version, io_cnt,
+                                        0, dtype, shape)
+            create_paddle_modelfile(True, models_dir, model_version, io_cnt,
+                                      0, dtype, shape)
+
     if FLAGS.tensorrt:
         create_plan_modelconfig(True, models_dir, model_version, io_cnt, 8,
                                 dtype, shape)
@@ -1093,6 +1242,10 @@ if __name__ == '__main__':
                         required=False,
                         action='store_true',
                         help='Generate Pytorch LibTorch models')
+    parser.add_argument('--paddle',
+                        required=False,
+                        action='store_true',
+                        help='Generate Paddle models')
     parser.add_argument('--openvino',
                         required=False,
                         action='store_true',
@@ -1125,6 +1278,11 @@ if __name__ == '__main__':
     if FLAGS.libtorch:
         import torch
         from torch import nn
+    if FLAGS.paddle:
+        import paddle
+        from paddle import nn
+        from paddle.static import InputSpec
+        from paddle.jit import to_static
     if FLAGS.tensorrt or FLAGS.tensorrt_big or FLAGS.tensorrt_shape_io:
         import tensorrt as trt
     if FLAGS.openvino:

@@ -165,6 +165,19 @@ def validate_for_libtorch_model(input_dtype, output0_dtype, output1_dtype,
     return True
 
 
+def validate_for_paddle_model(input_dtype, output0_dtype, output1_dtype,
+                              input_shape, output0_shape, output1_shape):
+    """Return True if input and output dtypes are supported by a paddle model."""
+
+    # STRING and UINT16 data types are not supported currently
+    if (input_dtype == np.object_) or (output0_dtype == np.object_) or (output1_dtype == np.object_):
+        return False
+    if (input_dtype == np.uint16) or (output0_dtype == np.uint16) or (output1_dtype == np.uint16):
+        return False
+
+    return True
+
+
 def validate_for_openvino_model(input_dtype, output0_dtype, output1_dtype,
                                 input_shape, output0_shape, output1_shape):
     """Return True if input and output dtypes are supported by an OpenVino model."""
