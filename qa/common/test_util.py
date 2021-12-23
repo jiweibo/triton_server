@@ -174,6 +174,13 @@ def validate_for_paddle_model(input_dtype, output0_dtype, output1_dtype,
         return False
     if (input_dtype == np.uint16) or (output0_dtype == np.uint16) or (output1_dtype == np.uint16):
         return False
+    # The cast op not supported int8
+    if (input_dtype == np.int8) or (output0_dtype == np.int8) or (output1_dtype == np.int8):
+        return False
+    # The cast op not supported int16
+    if (input_dtype == np.int16) or (output0_dtype == np.int16) or (output1_dtype == np.int16):
+        return False
+
 
     return True
 
