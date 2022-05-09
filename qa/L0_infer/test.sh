@@ -91,7 +91,7 @@ fi
 
 # Allow more time to exit. Ensemble brings in too many models
 SERVER_ARGS_EXTRA="--exit-timeout-secs=${SERVER_TIMEOUT} --backend-directory=${BACKEND_DIR} --backend-config=tensorflow,version=${TF_VERSION} --backend-config=python,stub-timeout-seconds=120"
-SERVER_ARGS="--model-repository=${MODELDIR} ${SERVER_ARGS_EXTRA}"
+SERVER_ARGS="--model-repository=${MODELDIR} ${SERVER_ARGS_EXTRA} --grpc-port=8111 --http-port=8110 --metrics-port=8112"
 SERVER_LOG_BASE="./inference_server"
 source ../common/util.sh
 
@@ -110,7 +110,8 @@ if [ "$TRITON_SERVER_CPU_ONLY" == "1" ]; then
 fi
 
 # If BACKENDS not specified, set to all
-BACKENDS=${BACKENDS:="graphdef savedmodel onnx libtorch plan python python_dlpack openvino"}
+#BACKENDS=${BACKENDS:="graphdef savedmodel onnx libtorch plan python openvino"}
+BACKENDS=${BACKENDS:="graphdef"}
 export BACKENDS
 
 # If ENSEMBLES not specified, set to 1

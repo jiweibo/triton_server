@@ -74,7 +74,7 @@ function wait_for_server_ready() {
         sleep 1;
 
         set +e
-        code=`curl -s -w %{http_code} localhost:8000/v2/health/ready`
+        code=`curl -s -w %{http_code} localhost:8110/v2/health/ready`
         set -e
         if [ "$code" == "200" ]; then
             return
@@ -90,7 +90,7 @@ function wait_for_server_ready() {
 # Wait until server health endpoint shows live. Sets WAIT_RET to 0 on
 # success, 1 on failure
 function wait_for_server_live() {
-    local spid="$1"; shift
+    local t="$1"; shift
     local wait_time_secs="${1:-30}"; shift
 
     WAIT_RET=0
@@ -106,7 +106,7 @@ function wait_for_server_live() {
         sleep 1;
 
         set +e
-        code=`curl -s -w %{http_code} localhost:8000/v2/health/live`
+        code=`curl -s -w %{http_code} localhost:8110/v2/health/live`
         set -e
         if [ "$code" == "200" ]; then
             return
@@ -131,8 +131,8 @@ function wait_for_model_stable() {
         sleep 1;
 
         set +e
-        total_count=`curl -s -X POST localhost:8000/v2/repository/index | json_pp | grep "state" | wc -l`
-        stable_count=`curl -s -X POST localhost:8000/v2/repository/index | json_pp | grep "READY\|UNAVAILABLE" | wc -l`
+        total_count=`curl -s -X POST localhost:8110/v2/repository/index | json_pp | grep "state" | wc -l`
+        stable_count=`curl -s -X POST localhost:8110/v2/repository/index | json_pp | grep "READY\|UNAVAILABLE" | wc -l`
         count=$((total_count - stable_count))
         set -e
         if [ "$count" == "0" ]; then
@@ -169,6 +169,7 @@ function run_server () {
 
     LD_PRELOAD=$SERVER_LD_PRELOAD $SERVER $SERVER_ARGS > $SERVER_LOG 2>&1 &
     SERVER_PID=$!
+    echo "SERVER_PID is ${SERVER_PID}"
 
     wait_for_server_ready $SERVER_PID $SERVER_TIMEOUT
     if [ "$WAIT_RET" != "0" ]; then

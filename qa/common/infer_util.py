@@ -118,16 +118,16 @@ def infer_exact(tester,
     # configs [ url, protocol, async stream, binary data ]
     configs = []
     if use_http:
-        configs.append(("localhost:8000", "http", False, True))
+        configs.append(("localhost:8110", "http", False, True))
         if output0_raw == output1_raw:
             # Float16 not supported for Input and Output via JSON
             if use_http_json_tensors and (input_dtype != np.float16) and \
                (output0_dtype != np.float16) and (output1_dtype != np.float16):
-                configs.append(("localhost:8000", "http", False, False))
+                configs.append(("localhost:8110", "http", False, False))
     if use_grpc:
-        configs.append(("localhost:8001", "grpc", False, False))
+        configs.append(("localhost:8111", "grpc", False, False))
     if use_streaming:
-        configs.append(("localhost:8001", "grpc", True, False))
+        configs.append(("localhost:8111", "grpc", True, False))
 
     # outputs are sum and difference of inputs so set max input
     # values so that they will not overflow the output. This
@@ -608,11 +608,11 @@ def infer_shape_tensor(tester,
 
     configs = []
     if use_http:
-        configs.append(("localhost:8000", "http", False))
+        configs.append(("localhost:8110", "http", False))
     if use_grpc:
-        configs.append(("localhost:8001", "grpc", False))
+        configs.append(("localhost:8111", "grpc", False))
     if use_streaming:
-        configs.append(("localhost:8001", "grpc", True))
+        configs.append(("localhost:8111", "grpc", True))
 
     io_cnt = len(input_shape_values)
 
@@ -825,13 +825,13 @@ def infer_zero(tester,
     tester.assertTrue(use_http or use_grpc or use_streaming)
     configs = []
     if use_http:
-        configs.append(("localhost:8000", "http", False, True))
+        configs.append(("localhost:8110", "http", False, True))
         if use_http_json_tensors and (tensor_dtype != np.float16):
-            configs.append(("localhost:8000", "http", False, False))
+            configs.append(("localhost:8110", "http", False, False))
     if use_grpc:
-        configs.append(("localhost:8001", "grpc", False, False))
+        configs.append(("localhost:8111", "grpc", False, False))
     if use_streaming:
-        configs.append(("localhost:8001", "grpc", True, False))
+        configs.append(("localhost:8111", "grpc", True, False))
     tester.assertEqual(len(input_shapes), len(output_shapes))
     io_cnt = len(input_shapes)
 

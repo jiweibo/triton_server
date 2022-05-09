@@ -59,6 +59,7 @@ OPENVINO_VERSION=2021.4.582
 
 UBUNTU_IMAGE=${UBUNTU_IMAGE:=ubuntu:20.04}
 PYTORCH_IMAGE=${PYTORCH_IMAGE:=nvcr.io/nvidia/pytorch:$TRITON_VERSION-py3}
+PADDLE_IMAGE=${PADDLE_IMAGE:=paddlepaddle/paddle:2.2.1}
 TENSORFLOW_IMAGE=${TENSORFLOW_IMAGE:=nvcr.io/nvidia/tensorflow:$TRITON_VERSION-tf1-py3}
 TENSORRT_IMAGE=${TENSORRT_IMAGE:=nvcr.io/nvidia/tensorrt:$TRITON_VERSION-py3}
 CUDA_DEVICE=0
@@ -146,6 +147,7 @@ cp ./gen_tag_sigdef.py $HOST_SRCDIR/.
 ONNXSCRIPT=onnx_gen.cmds
 OPENVINOSCRIPT=openvino_gen.cmds
 TORCHSCRIPT=torch_gen.cmds
+PADDLESCRIPT=paddle_gen.cmds
 TFSCRIPT=tf_gen.cmds
 TRTSCRIPT=trt_gen.cmds
 
@@ -342,6 +344,48 @@ docker run --gpus device=$CUDA_DEVICE --rm --entrypoint $SRCDIR/$TORCHSCRIPT \
        --mount type=bind,source=$HOST_DYNASEQDESTDIR,target=$DYNASEQDESTDIR \
        --mount type=bind,source=$HOST_VARSEQDESTDIR,target=$VARSEQDESTDIR \
        $PYTORCH_IMAGE
+if [ $? -ne 0 ]; then
+    echo -e "Failed"
+    exit 1
+fi
+
+# Paddle
+cat >$HOST_SRCDIR/$PADDLESCRIPT <<EOF
+#!/bin/bash
+set -e
+python3 $SRCDIR/gen_qa_models.py --paddle --models_dir=$DESTDIR
+chmod -R 777 $DESTDIR
+python3 $SRCDIR/gen_qa_models.py --paddle --variable --models_dir=$VARDESTDIR
+chmod -R 777 $VARDESTDIR
+python3 $SRCDIR/gen_qa_identity_models.py --paddle --models_dir=$IDENTITYDESTDIR
+chmod -R 777 $IDENTITYDESTDIR
+python3 $SRCDIR/gen_qa_reshape_models.py --paddle --variable --models_dir=$RESHAPEDESTDIR
+chmod -R 777 $RESHAPEDESTDIR
+python3 $SRCDIR/gen_qa_sequence_models.py --paddle --models_dir=$SEQDESTDIR
+chmod -R 777 $SEQDESTDIR
+python3 $SRCDIR/gen_qa_sequence_models.py --paddle --variable --models_dir=$VARSEQDESTDIR
+chmod -R 777 $VARSEQDESTDIR
+python3 $SRCDIR/gen_qa_dyna_sequence_models.py --paddle --models_dir=$DYNASEQDESTDIR
+chmod -R 777 $DYNASEQDESTDIR
+EOF
+
+chmod a+x $HOST_SRCDIR/$PADDLESCRIPT
+if [ $? -ne 0 ]; then
+    echo -e "Failed: chmod"
+    exit 1
+fi
+
+docker pull $PADDLE_IMAGE
+docker run --gpus device=$CUDA_DEVICE --rm --entrypoint $SRCDIR/$TORCHSCRIPT \
+       --mount type=bind,source=$HOST_SRCDIR,target=$SRCDIR \
+       --mount type=bind,source=$HOST_DESTDIR,target=$DESTDIR \
+       --mount type=bind,source=$HOST_VARDESTDIR,target=$VARDESTDIR \
+       --mount type=bind,source=$HOST_IDENTITYDESTDIR,target=$IDENTITYDESTDIR \
+       --mount type=bind,source=$HOST_RESHAPEDESTDIR,target=$RESHAPEDESTDIR \
+       --mount type=bind,source=$HOST_SEQDESTDIR,target=$SEQDESTDIR \
+       --mount type=bind,source=$HOST_DYNASEQDESTDIR,target=$DYNASEQDESTDIR \
+       --mount type=bind,source=$HOST_VARSEQDESTDIR,target=$VARSEQDESTDIR \
+       $PADDLE_IMAGE
 if [ $? -ne 0 ]; then
     echo -e "Failed"
     exit 1
