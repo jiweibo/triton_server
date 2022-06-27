@@ -31,6 +31,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#include <algorithm>
 #include "src/core/constants.h"
 #include "src/core/dynamic_batch_scheduler.h"
 #include "src/core/logging.h"
@@ -59,11 +60,37 @@ SequenceBatchScheduler::Create(
   auto instance_count = model->Instances().size();
   sched->queue_request_cnts_.resize(instance_count, 0);
 
-  auto config = model->Config();
+  auto& config = model->Config();
 
   // Max sequence idle...
   sched->max_sequence_idle_microseconds_ =
       config.sequence_batching().max_sequence_idle_microseconds();
+
+  sched->max_batch_size_ = config.max_batch_size();
+
+  // Implicit States
+  auto& states = config.sequence_batching().state();
+
+  for (const inference::ModelSequenceBatching_State& state : states) {
+    sched->state_output_config_map_.insert({state.output_name(), state});
+
+    if (state.initial_state_size() > 1) {
+      return Status(
+          Status::Code::INVALID_ARG,
+          std::string(
+              std::string("initial_state field for state input '") +
+              state.input_name() +
+              "' must contain exactly one or zero element. Found '" +
+              std::to_string(state.initial_state_size()) + "' elements."));
+    }
+
+    // If the model configuration has initial_state field.
+    if (state.initial_state_size() == 1) {
+      auto& initial_state = state.initial_state(0);
+      RETURN_IF_ERROR(
+          sched->GenerateInitialStateData(initial_state, state, model));
+    }
+  }
 
   // Get the number of candidate sequence slots to allow for each
   // runner. This is at least 1 even if the model doesn't support
@@ -86,6 +113,14 @@ SequenceBatchScheduler::Create(
   RETURN_IF_ERROR(sched->CreateBooleanControlTensors(
       config, &start, &end, &startend, &cont, &notready));
 
+  bool has_optional_input = false;
+  for (const auto& input : config.input()) {
+    if (input.optional()) {
+      has_optional_input = true;
+      break;
+    }
+  }
+
   // Create one SequenceBatch object for each requested runner. The
   // SequenceBatch object has a thread that manages the batch of
   // requests.
@@ -100,13 +135,13 @@ SequenceBatchScheduler::Create(
     if (config.sequence_batching().has_oldest()) {
       sb.reset(new OldestSequenceBatch(
           sched.get(), index, seq_slot_cnt, instance.get(),
-          enforce_equal_shape_tensors, start, end, startend, cont, notready,
-          &init_state));
+          enforce_equal_shape_tensors, has_optional_input, start, end, startend,
+          cont, notready, &init_state));
     } else {
       sb.reset(new DirectSequenceBatch(
           sched.get(), index, seq_slot_cnt, instance.get(),
-          enforce_equal_shape_tensors, start, end, startend, cont, notready,
-          &init_state));
+          enforce_equal_shape_tensors, has_optional_input, start, end, startend,
+          cont, notready, &init_state));
     }
 
     if (init_state) {
@@ -139,6 +174,139 @@ SequenceBatchScheduler::Create(
   return Status::Success;
 }
 
+Status
+SequenceBatchScheduler::GenerateInitialStateData(
+    const inference::ModelSequenceBatching_InitialState& initial_state,
+    const inference::ModelSequenceBatching_State& state, TritonModel* model)
+{
+  if (initial_state.data_type() != state.data_type()) {
+    return Status(
+        Status::Code::INVALID_ARG,
+        std::string("The data type used for 'initial_state' field of state '") +
+            state.input_name() + "' does not match the state data type.");
+  }
+
+  if (initial_state.name().size() == 0) {
+    return Status(
+        Status::Code::INVALID_ARG,
+        std::string("Field 'name' must be set when using initial_state for "
+                    "state input '") +
+            state.input_name() + "'.");
+  }
+
+  auto initial_state_itr = initial_state_.find(state.input_name());
+  if (initial_state_itr != initial_state_.end()) {
+    return Status(
+        Status::Code::INVALID_ARG, std::string("State input name '") +
+                                       state.input_name() +
+                                       "' specified more than once.");
+  }
+
+  if (initial_state.dims().size() != state.dims().size()) {
+    return Status(
+        Status::Code::INVALID_ARG,
+        std::string(
+            "Number of dimensions in 'initial_state' doesn't match the size of"
+            " 'state' dimensions for state input '") +
+            state.input_name() + "'. " +
+            std::to_string(initial_state.dims().size()) +
+            " != " + std::to_string(state.dims().size()));
+  }
+
+  // Check the dimensions to make sure it doesn't have variable-sized dims and
+  // matches the state description.
+  auto initial_state_dim = initial_state.dims().begin();
+  auto state_dim = state.dims().begin();
+  for (; initial_state_dim != initial_state.dims().end();
+       initial_state_dim++, state_dim++) {
+    if (*initial_state_dim == -1) {
+      return Status(
+          Status::Code::INVALID_ARG,
+          std::string("'initial_state' field for state input name '") +
+              state.input_name() + "' contains variable dimensions.");
+    } else {
+      if (*state_dim != -1 && *initial_state_dim != *state_dim) {
+        return Status(
+            Status::Code::INVALID_ARG,
+            std::string("'initial_state' dim for input name '") +
+                state.input_name() +
+                "' doesn't match 'state' dim description. " +
+                std::to_string(*initial_state_dim) +
+                " != " + std::to_string(*state_dim));
+      }
+    }
+  }
+
+  const auto& initial_state_pair = initial_state_.emplace(
+      std::piecewise_construct, std::forward_as_tuple(state.input_name()),
+      std::forward_as_tuple(initial_state.name()));
+  auto& initial_state_data = initial_state_pair.first->second;
+
+  // Calculate total memory byte size
+  auto element_count = GetElementCount(initial_state.dims());
+  size_t dtype_byte_size = GetDataTypeByteSize(initial_state.data_type());
+  size_t total_byte_size = element_count * dtype_byte_size;
+
+  // Custom handling for TYPE_BYTES
+  if (dtype_byte_size == 0) {
+    total_byte_size = sizeof(int32_t) * element_count;
+  }
+
+  switch (initial_state.state_data_case()) {
+    case inference::ModelSequenceBatching_InitialState::StateDataCase::
+        kZeroData: {
+      initial_state_data.data_ = std::make_shared<AllocatedMemory>(
+          total_byte_size, TRITONSERVER_MEMORY_CPU /* memory_type */,
+          0 /* memory_type_id */);
+
+      TRITONSERVER_MemoryType memory_type;
+      int64_t memory_type_id;
+      char* data_ptr = initial_state_data.data_->MutableBuffer(
+          &memory_type, &memory_type_id);
+      memset(data_ptr, 0, total_byte_size);
+      break;
+    }
+    case inference::ModelSequenceBatching_InitialState::StateDataCase::
+        kDataFile: {
+      std::string file_input;
+      RETURN_IF_ERROR(ReadTextFile(
+          JoinPath({model->LocalizedModelPath(), kInitialStateFolder,
+                    (initial_state.data_file())}),
+          &file_input));
+      if (initial_state.data_type() == inference::DataType::TYPE_STRING) {
+        total_byte_size = file_input.size();
+      } else if (total_byte_size > file_input.size()) {
+        return Status(
+            Status::Code::INVALID_ARG,
+            "initial_state setting expects " + std::to_string(total_byte_size) +
+                " bytes, but the data "
+                "provided from " +
+                initial_state.data_file() + "only has " +
+                std::to_string(file_input.size()) + " bytes.");
+      }
+
+      TRITONSERVER_MemoryType memory_type;
+      int64_t memory_type_id;
+
+      initial_state_data.data_ = std::make_shared<AllocatedMemory>(
+          total_byte_size, TRITONSERVER_MEMORY_CPU /* memory_type */,
+          0 /* memory_type_id */);
+      char* data_ptr = initial_state_data.data_->MutableBuffer(
+          &memory_type, &memory_type_id);
+      memcpy(data_ptr, file_input.data(), total_byte_size);
+
+      break;
+    }
+    default:
+      return Status(
+          Status::Code::INVALID_ARG,
+          std::string("initial_state setting expects state'") +
+              state.input_name() + "' to have state_data set");
+  }
+
+  return Status::Success;
+}
+
 SequenceBatchScheduler::~SequenceBatchScheduler()
 {
   // Signal the reaper thread to exit...
@@ -152,6 +320,7 @@ SequenceBatchScheduler::~SequenceBatchScheduler()
     reaper_thread_->join();
   }
 }
+
 
 namespace {
 
@@ -698,6 +867,7 @@ SequenceBatch::SequenceBatch(
     SequenceBatchScheduler* base, const uint32_t batcher_idx,
     const size_t seq_slot_cnt,
     const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+    const bool has_optional_input,
     const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
         start_input_overrides,
     const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
@@ -710,11 +880,13 @@ SequenceBatch::SequenceBatch(
         notready_input_overrides)
     : base_(base), batcher_idx_(batcher_idx), seq_slot_cnt_(seq_slot_cnt),
       enforce_equal_shape_tensors_(enforce_equal_shape_tensors),
+      has_optional_input_(has_optional_input),
       start_input_overrides_(start_input_overrides),
       end_input_overrides_(end_input_overrides),
       startend_input_overrides_(startend_input_overrides),
       continue_input_overrides_(continue_input_overrides),
-      notready_input_overrides_(notready_input_overrides)
+      notready_input_overrides_(notready_input_overrides),
+      sequence_states_(seq_slot_cnt)
 {
 }
 
@@ -856,10 +1028,36 @@ SequenceBatch::SetControlTensors(
   }
 }
 
+void
+SequenceBatch::UpdateImplicitState(
+    std::unique_ptr<InferenceRequest>& irequest, const int32_t seq_slot)
+{
+  // This should be executed only if the model has a states section.
+  if (!base_->StateOutputConfigMap().empty()) {
+    auto& sequence_states = sequence_states_[seq_slot];
+
+    // Initialize the input state if the sequence is starting.
+    if ((irequest->Flags() & TRITONSERVER_REQUEST_FLAG_SEQUENCE_START) != 0) {
+      sequence_states = nullptr;
+    }
+
+    // Create the state for the first request in the sequence.
+    if (sequence_states == nullptr) {
+      sequence_states.reset(new SequenceStates);
+      sequence_states->Initialize(
+          base_->StateOutputConfigMap(), base_->MaxBatchSize(),
+          base_->InitialState());
+    }
+
+    irequest->SetSequenceStates(sequence_states);
+  }
+}
+
 DirectSequenceBatch::DirectSequenceBatch(
     SequenceBatchScheduler* base, const uint32_t batcher_idx,
     const size_t seq_slot_cnt, TritonModelInstance* model_instance,
     const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+    const bool has_optional_input,
     const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
         start_input_overrides,
     const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
@@ -873,8 +1071,9 @@ DirectSequenceBatch::DirectSequenceBatch(
     bool* is_initialized)
     : SequenceBatch(
           base, batcher_idx, seq_slot_cnt, enforce_equal_shape_tensors,
-          start_input_overrides, end_input_overrides, startend_input_overrides,
-          continue_input_overrides, notready_input_overrides),
+          has_optional_input, start_input_overrides, end_input_overrides,
+          startend_input_overrides, continue_input_overrides,
+          notready_input_overrides),
       model_instance_(model_instance), scheduler_thread_exit_(false),
       scheduler_idle_(false), queues_(seq_slot_cnt),
       seq_slot_correlation_ids_(seq_slot_cnt, 0), max_active_seq_slot_(-1)
@@ -914,7 +1113,7 @@ DirectSequenceBatch::~DirectSequenceBatch()
   cv_.notify_one();
 
   // It is possible for the scheduler thread to be the last holder of
-  // a backend object, and when that scheduler thread releases the
+  // a model object, and when that scheduler thread releases the
   // object the scheduler thread itself will destroy this
   // SequenceBatch object. So we need to check to make sure the
   // scheduler thread does not join it against itself and instead
@@ -992,6 +1191,10 @@ DirectSequenceBatch::BatcherThread(const int nice)
 
   NewPayload();
 
+  // When there is optional input or input shape must be enforced,
+  // the inputs in the requests must be examined for forming a batch
+  const bool check_input =
+      !enforce_equal_shape_tensors_.empty() || has_optional_input_;
   while (!scheduler_thread_exit_) {
     uint64_t wait_microseconds = default_wait_microseconds;
 
@@ -1064,16 +1267,16 @@ DirectSequenceBatch::BatcherThread(const int nice)
             // created batch.
             if (null_irequest == nullptr) {
               null_irequest = queue.front().get();
+              UpdateImplicitState(queue.front(), seq_slot);
             }
 
             // If this is the first non-null request capture the shape
             // of the tensors that don't support ragged so we can
             // compare them to later requests.
-            if (required_equal_inputs.empty() &&
-                !enforce_equal_shape_tensors_.empty()) {
+            if (required_equal_inputs.empty() && check_input) {
               Status status = InitRequiredEqualInputs(
                   queue.front(), enforce_equal_shape_tensors_,
-                  &required_equal_inputs);
+                  has_optional_input_, &required_equal_inputs);
               if (!status.IsOk()) {
                 LOG_ERROR
                     << "internal: unexpecting failure initializing shape: "
@@ -1096,9 +1299,9 @@ DirectSequenceBatch::BatcherThread(const int nice)
           } else {
             // Compare the age of the oldest pending request to the maximum
             // batch queuing delay, and the size of the ready requests in the
-            // batch, execute now if queuing delay is exceeded or the batch size
-            // is large enough. Otherwise create a timer to wakeup a thread to
-            // check again at the maximum allowed delay.
+            // batch, execute now if queuing delay is exceeded or the batch
+            // size is large enough. Otherwise create a timer to wakeup a
+            // thread to check again at the maximum allowed delay.
             uint64_t now_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
@@ -1148,11 +1351,10 @@ DirectSequenceBatch::BatcherThread(const int nice)
           // If there are one or more tensors that don't support
           // ragged batch, then don't allow a request into an existing
           // batch if shape differs.
-          else if (
-              !required_equal_inputs.empty() &&
-              !enforce_equal_shape_tensors_.empty()) {
+          else if (!required_equal_inputs.empty() && check_input) {
             if (!CompareWithRequiredEqualInputs(
-                    queue.front(), required_equal_inputs)) {
+                    queue.front(), has_optional_input_,
+                    required_equal_inputs)) {
               use_null_request = true;
             }
           }
@@ -1168,6 +1370,22 @@ DirectSequenceBatch::BatcherThread(const int nice)
             // just use zero for that.
             SetControlTensors(
                 ni, seq_slot, 0 /* corrid */, true /* not_ready */);
+
+            // This should be executed only if the model has a states section.
+            if (!base_->StateOutputConfigMap().empty()) {
+              // For NULL requests we will be using a dummy state instead of the
+              // real state stored in Triton. When the model is using variable
+              // dimensions and batching, the null request's input state shapes
+              // may be different from the actual shapes of the state for that
+              // sequence. We create a dummy state in order to avoid corrupting
+              // the actual state of the sequence.
+              std::shared_ptr<SequenceStates> sequence_states(
+                  new SequenceStates);
+              sequence_states->SetNullSequenceStates(
+                  null_irequest->GetSequenceStates());
+              ni->SetSequenceStates(sequence_states);
+            }
+
             curr_payload_->AddRequest(std::move(ni));
           } else {
             std::unique_ptr<InferenceRequest>& irequest = queue.front();
@@ -1176,11 +1394,13 @@ DirectSequenceBatch::BatcherThread(const int nice)
             SetControlTensors(
                 irequest, seq_slot, seq_slot_correlation_ids_[seq_slot]);
 
+            // Update the implicit state and set the input state tensors.
+            UpdateImplicitState(irequest, seq_slot);
+
             if ((irequest->Flags() & TRITONSERVER_REQUEST_FLAG_SEQUENCE_END) !=
                 0) {
               end_of_sequence = true;
             }
-
             curr_payload_->AddRequest(std::move(irequest));
 
             queue.pop_front();
@@ -1236,7 +1456,7 @@ DirectSequenceBatch::BatcherThread(const int nice)
     }
 
     if (curr_payload_->GetState() == Payload::State::READY) {
-      // Run the backend...
+      // Run the model...
       model_instance_->Model()->Server()->GetRateLimiter()->EnqueuePayload(
           model_instance_->Model(), curr_payload_);
       NewPayload();
@@ -1251,6 +1471,7 @@ OldestSequenceBatch::OldestSequenceBatch(
     SequenceBatchScheduler* base, const uint32_t batcher_idx,
     const size_t seq_slot_cnt, TritonModelInstance* model_instance,
     const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+    const bool has_optional_input,
     const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
         start_input_overrides,
     const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
@@ -1264,8 +1485,9 @@ OldestSequenceBatch::OldestSequenceBatch(
     bool* is_initialized)
     : SequenceBatch(
           base, batcher_idx, seq_slot_cnt, enforce_equal_shape_tensors,
-          start_input_overrides, end_input_overrides, startend_input_overrides,
-          continue_input_overrides, notready_input_overrides),
+          has_optional_input, start_input_overrides, end_input_overrides,
+          startend_input_overrides, continue_input_overrides,
+          notready_input_overrides),
       in_flight_(seq_slot_cnt, false), queues_(seq_slot_cnt)
 {
   // Initialize to handle CORRID control. If error just exit
@@ -1291,8 +1513,7 @@ OldestSequenceBatch::OldestSequenceBatch(
       model_instance->Model(), model_instance, GetCpuNiceLevel(config),
       true /* dynamic_batching_enabled */, config.max_batch_size(),
       enforce_equal_shape_tensors_, true /* preserve_ordering */,
-      false /* response_cache_enable */,
-      preferred_batch_sizes,
+      false /* response_cache_enable */, preferred_batch_sizes,
       config.sequence_batching().oldest().max_queue_delay_microseconds(),
       &dynamic_batcher_);
   if (!status.IsOk()) {
@@ -1357,6 +1578,9 @@ OldestSequenceBatch::CompleteAndNext(const uint32_t seq_slot)
         // Add the appropriate control tensor values to the request.
         SetControlTensors(irequest, seq_slot, correlation_id);
 
+        // Update the implicit state and set the input state tensors.
+        UpdateImplicitState(irequest, seq_slot);
+
         LOG_VERBOSE(1) << "issue to dynamic batcher CORRID " << correlation_id
                        << " in batcher " << batcher_idx_ << ", slot "
                        << seq_slot;
@@ -1387,6 +1611,7 @@ OldestSequenceBatch::CompleteAndNext(const uint32_t seq_slot)
           batcher_idx_, seq_slot);
       const InferenceRequest::SequenceId& released_cid =
           base_->ReleaseSequenceSlot(batcher_seq_slot, &queue);
+
       if (released_cid.InSequence()) {
         LOG_VERBOSE(1) << "Enqueued new sequence containing " << queue.size()
                        << " requests into OldestFirst batcher " << batcher_idx_
@@ -1425,5 +1650,4 @@ OldestSequenceBatch::Enqueue(
     CompleteAndNext(seq_slot);
   }
 }
-
 }}  // namespace nvidia::inferenceserver

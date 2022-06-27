@@ -64,13 +64,30 @@ from distutils.dir_util import copy_tree
 # different versions are used then one backend or the other will
 # incorrectly load the other version of the openvino libraries.
 #
+# The standalone openVINO describes multiple versions where each version
+# is a pair of openVINO version and openVINO package version. When openVINO
+# package version is specified, then backend will be built with pre-built
+# openVINO release from Intel. If the package version is specified as None,
+# then openVINO for the backend is built from source with openMP support.
+# By default, only the first version is built. To build the all the versions
+# in list use --build-multiple-openvino. Triton will use the first version
+# for inference by default. In order to use different version, Triton should
+# be invoked with appropriate backend configuration:
+# (--backend-config=openvino,version=<version_str>)
+# The version string can be obtained as follows:
+# <major_version>_<minor_version>[_pre] 
+# Append '_pre' only if the openVINO backend was built with prebuilt openVINO
+# library. In other words, when the second element of the pair is not None.
+# To use ('2021.2', None) version_str should be `2021_2'.
+# To use ('2021.4', '2021.4.582') version_str should be `2021_4_pre'.
+#
 TRITON_VERSION_MAP = {
-    '2.15.0dev': (
-        '21.10dev',  # triton container
-        '21.09',  # upstream container
-        '1.9.0',  # ORT
+    '2.18.0dev': (
+        '22.01dev',  # triton container
+        '21.11',  # upstream container
+        '1.10.0',  # ORT
         '2021.2.200',  # ORT OpenVINO
-        '2021.2',  # Standalone OpenVINO
+        (('2021.2', None), ('2021.4', '2021.4.582')),  # Standalone OpenVINO
         '2.2.9')  # DCGM version
 }
 
@@ -82,6 +99,10 @@ NONCORE_BACKENDS = [
 ]
 EXAMPLE_REPOAGENTS = ['checksum']
 FLAGS = None
+EXTRA_CORE_CMAKE_FLAGS = {}
+OVERRIDE_CORE_CMAKE_FLAGS = {}
+EXTRA_BACKEND_CMAKE_FLAGS = {}
+OVERRIDE_BACKEND_CMAKE_FLAGS = {}
 
 
 def log(msg, force=False):
@@ -235,64 +256,153 @@ def makeinstall(cwd, target='install'):
     fail_if(p.returncode != 0, 'make {} failed'.format(target))
 
 
-def cmake_enable(flag):
-    return 'ON' if flag else 'OFF'
+def cmake_core_arg(name, type, value):
+    # Return cmake -D setting to set name=value for core build. Use
+    # command-line specified value if one is given.
+    if name in OVERRIDE_CORE_CMAKE_FLAGS:
+        value = OVERRIDE_CORE_CMAKE_FLAGS[name]
+    if type is None:
+        type = ''
+    else:
+        type = ':{}'.format(type)
+    return '-D{}{}={}'.format(name, type, value)
+
+
+def cmake_core_enable(name, flag):
+    # Return cmake -D setting to set name=flag?ON:OFF for core
+    # build. Use command-line specified value for 'flag' if one is
+    # given.
+    if name in OVERRIDE_CORE_CMAKE_FLAGS:
+        value = OVERRIDE_CORE_CMAKE_FLAGS[name]
+    else:
+        value = 'ON' if flag else 'OFF'
+    return '-D{}:BOOL={}'.format(name, value)
+
+
+def cmake_core_extra_args():
+    args = []
+    for k, v in EXTRA_CORE_CMAKE_FLAGS.items():
+        args.append('-D{}={}'.format(k, v))
+    return args
+
+
+def cmake_backend_arg(backend, name, type, value):
+    # Return cmake -D setting to set name=value for backend build. Use
+    # command-line specified value if one is given.
+    if backend in OVERRIDE_BACKEND_CMAKE_FLAGS:
+        if name in OVERRIDE_BACKEND_CMAKE_FLAGS[backend]:
+            value = OVERRIDE_BACKEND_CMAKE_FLAGS[backend][name]
+    if type is None:
+        type = ''
+    else:
+        type = ':{}'.format(type)
+    return '-D{}{}={}'.format(name, type, value)
+
+
+def cmake_backend_enable(backend, name, flag):
+    # Return cmake -D setting to set name=flag?ON:OFF for backend
+    # build. Use command-line specified value for 'flag' if one is
+    # given.
+    value = None
+    if backend in OVERRIDE_BACKEND_CMAKE_FLAGS:
+        if name in OVERRIDE_BACKEND_CMAKE_FLAGS[backend]:
+            value = OVERRIDE_BACKEND_CMAKE_FLAGS[backend][name]
+    if value is None:
+        value = 'ON' if flag else 'OFF'
+    return '-D{}:BOOL={}'.format(name, value)
+
+
+def cmake_backend_extra_args(backend):
+    args = []
+    if backend in EXTRA_BACKEND_CMAKE_FLAGS:
+        for k, v in EXTRA_BACKEND_CMAKE_FLAGS[backend].items():
+            args.append('-D{}={}'.format(k, v))
+    return args
+
+
+def cmake_repoagent_arg(name, type, value):
+    # For now there is no override for repo-agents
+    if type is None:
+        type = ''
+    else:
+        type = ':{}'.format(type)
+    return '-D{}{}={}'.format(name, type, value)
+
+
+def cmake_repoagent_enable(name, flag):
+    # For now there is no override for repo-agents
+    value = 'ON' if flag else 'OFF'
+    return '-D{}:BOOL={}'.format(name, value)
+
+
+def cmake_repoagent_extra_args():
+    # For now there is no extra args for repo-agents
+    args = []
+    return args
 
 
 def core_cmake_args(components, backends, install_dir):
     cargs = [
-        '-DCMAKE_BUILD_TYPE={}'.format(FLAGS.build_type),
-        '-DCMAKE_INSTALL_PREFIX:PATH={}'.format(install_dir),
-        '-DTRITON_COMMON_REPO_TAG:STRING={}'.format(components['common']),
-        '-DTRITON_CORE_REPO_TAG:STRING={}'.format(components['core']),
-        '-DTRITON_BACKEND_REPO_TAG:STRING={}'.format(components['backend']),
-        '-DTRITON_THIRD_PARTY_REPO_TAG:STRING={}'.format(
-            components['thirdparty'])
+        cmake_core_arg('CMAKE_BUILD_TYPE', None, FLAGS.build_type),
+        cmake_core_arg('CMAKE_INSTALL_PREFIX', 'PATH', install_dir),
+        cmake_core_arg('TRITON_COMMON_REPO_TAG', 'STRING',
+                       components['common']),
+        cmake_core_arg('TRITON_CORE_REPO_TAG', 'STRING', components['core']),
+        cmake_core_arg('TRITON_BACKEND_REPO_TAG', 'STRING',
+                       components['backend']),
+        cmake_core_arg('TRITON_THIRD_PARTY_REPO_TAG', 'STRING',
+                       components['thirdparty'])
     ]
 
-    cargs.append('-DTRITON_ENABLE_LOGGING:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_logging)))
-    cargs.append('-DTRITON_ENABLE_STATS:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_stats)))
-    cargs.append('-DTRITON_ENABLE_METRICS:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_metrics)))
-    cargs.append('-DTRITON_ENABLE_METRICS_GPU:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_gpu_metrics)))
-    cargs.append('-DTRITON_ENABLE_TRACING:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_tracing)))
-    cargs.append('-DTRITON_ENABLE_NVTX:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_nvtx)))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_LOGGING', FLAGS.enable_logging))
+    cargs.append(cmake_core_enable('TRITON_ENABLE_STATS', FLAGS.enable_stats))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_METRICS', FLAGS.enable_metrics))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_METRICS_GPU',
+                          FLAGS.enable_gpu_metrics))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_TRACING', FLAGS.enable_tracing))
+    cargs.append(cmake_core_enable('TRITON_ENABLE_NVTX', FLAGS.enable_nvtx))
 
-    cargs.append('-DTRITON_ENABLE_GPU:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_gpu)))
-    cargs.append('-DTRITON_MIN_COMPUTE_CAPABILITY={}'.format(
-        FLAGS.min_compute_capability))
+    cargs.append(cmake_core_enable('TRITON_ENABLE_GPU', FLAGS.enable_gpu))
+    cargs.append(
+        cmake_core_arg('TRITON_MIN_COMPUTE_CAPABILITY', None,
+                       FLAGS.min_compute_capability))
 
-    cargs.append('-DTRITON_ENABLE_MALI_GPU:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_mali_gpu)))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_MALI_GPU', FLAGS.enable_mali_gpu))
 
-    cargs.append('-DTRITON_ENABLE_GRPC:BOOL={}'.format(
-        cmake_enable('grpc' in FLAGS.endpoint)))
-    cargs.append('-DTRITON_ENABLE_HTTP:BOOL={}'.format(
-        cmake_enable('http' in FLAGS.endpoint)))
-    cargs.append('-DTRITON_ENABLE_SAGEMAKER:BOOL={}'.format(
-        cmake_enable('sagemaker' in FLAGS.endpoint)))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_GRPC', 'grpc' in FLAGS.endpoint))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_HTTP', 'http' in FLAGS.endpoint))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_SAGEMAKER', 'sagemaker'
+                          in FLAGS.endpoint))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_VERTEX_AI', 'vertex-ai'
+                          in FLAGS.endpoint))
 
-    cargs.append('-DTRITON_ENABLE_GCS:BOOL={}'.format(
-        cmake_enable('gcs' in FLAGS.filesystem)))
-    cargs.append('-DTRITON_ENABLE_S3:BOOL={}'.format(
-        cmake_enable('s3' in FLAGS.filesystem)))
-    cargs.append('-DTRITON_ENABLE_AZURE_STORAGE:BOOL={}'.format(
-        cmake_enable('azure_storage' in FLAGS.filesystem)))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_GCS', 'gcs' in FLAGS.filesystem))
+    cargs.append(cmake_core_enable('TRITON_ENABLE_S3', 's3'
+                                   in FLAGS.filesystem))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_AZURE_STORAGE', 'azure_storage'
+                          in FLAGS.filesystem))
 
-    cargs.append('-DTRITON_ENABLE_TENSORFLOW={}'.format(
-        cmake_enable(('tensorflow1' in backends) or
-                     ('tensorflow2' in backends))))
+    cargs.append(
+        cmake_core_enable('TRITON_ENABLE_TENSORFLOW',
+                          ('tensorflow1' in backends) or
+                          ('tensorflow2' in backends)))
 
     for be in (CORE_BACKENDS + NONCORE_BACKENDS):
         if not be.startswith('tensorflow'):
-            cargs.append('-DTRITON_ENABLE_{}={}'.format(
-                be.upper(), cmake_enable(be in backends)))
+            cargs.append(
+                cmake_core_enable('TRITON_ENABLE_{}'.format(be.upper()), be
+                                  in backends))
         if be == 'tensorrt':
             cargs += tensorrt_cmake_args()
         if (be in CORE_BACKENDS) and (be in backends):
@@ -305,8 +415,9 @@ def core_cmake_args(components, backends, install_dir):
     # corresponding cmake value.
     for evar, eval in os.environ.items():
         if evar.startswith('TRITONBUILD_'):
-            cargs.append('-D{}={}'.format(evar[len('TRITONBUILD_'):], eval))
+            cargs.append(cmake_core_arg(evar[len('TRITONBUILD_'):], None, eval))
 
+    cargs += cmake_core_extra_args()
     cargs.append(FLAGS.cmake_dir)
     return cargs
 
@@ -322,21 +433,24 @@ def repoagent_cmake_args(images, components, ra, install_dir):
         fail('unknown agent {}'.format(ra))
 
     cargs = args + [
-        '-DCMAKE_BUILD_TYPE={}'.format(FLAGS.build_type),
-        '-DCMAKE_INSTALL_PREFIX:PATH={}'.format(install_dir),
-        '-DTRITON_COMMON_REPO_TAG:STRING={}'.format(components['common']),
-        '-DTRITON_CORE_REPO_TAG:STRING={}'.format(components['core'])
+        cmake_repoagent_arg('CMAKE_BUILD_TYPE', None, FLAGS.build_type),
+        cmake_repoagent_arg('CMAKE_INSTALL_PREFIX', 'PATH', install_dir),
+        cmake_repoagent_arg('TRITON_COMMON_REPO_TAG', 'STRING',
+                            components['common']),
+        cmake_repoagent_arg('TRITON_CORE_REPO_TAG', 'STRING',
+                            components['core'])
     ]
 
-    cargs.append('-DTRITON_ENABLE_GPU:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_gpu)))
+    cargs.append(cmake_repoagent_enable('TRITON_ENABLE_GPU', FLAGS.enable_gpu))
 
     # If TRITONBUILD_* is defined in the env then we use it to set
     # corresponding cmake value.
     for evar, eval in os.environ.items():
         if evar.startswith('TRITONBUILD_'):
-            cargs.append('-D{}={}'.format(evar[len('TRITONBUILD_'):], eval))
+            cargs.append(
+                cmake_repoagent_arg(evar[len('TRITONBUILD_'):], None, eval))
 
+    cargs += cmake_repoagent_extra_args()
     cargs.append('..')
     return cargs
 
@@ -344,14 +458,17 @@ def repoagent_cmake_args(images, components, ra, install_dir):
 def backend_repo(be):
     if (be == 'tensorflow1') or (be == 'tensorflow2'):
         return 'tensorflow_backend'
+    if be.startswith("openvino"):
+        return 'openvino_backend'
     return '{}_backend'.format(be)
 
 
-def backend_cmake_args(images, components, be, install_dir, library_paths):
+def backend_cmake_args(images, components, be, install_dir, library_paths,
+                       variant_index):
     if be == 'onnxruntime':
         args = onnxruntime_cmake_args(images, library_paths)
-    elif be == 'openvino':
-        args = openvino_cmake_args()
+    elif be.startswith('openvino'):
+        args = openvino_cmake_args(be, variant_index)
     elif be == 'tensorflow1':
         args = tensorflow_cmake_args(1, images, library_paths)
     elif be == 'tensorflow2':
@@ -376,106 +493,170 @@ def backend_cmake_args(images, components, be, install_dir, library_paths):
         fail('unknown backend {}'.format(be))
 
     cargs = args + [
-        '-DCMAKE_BUILD_TYPE={}'.format(FLAGS.build_type),
-        '-DCMAKE_INSTALL_PREFIX:PATH={}'.format(install_dir),
-        '-DTRITON_COMMON_REPO_TAG:STRING={}'.format(components['common']),
-        '-DTRITON_CORE_REPO_TAG:STRING={}'.format(components['core']),
-        '-DTRITON_BACKEND_REPO_TAG:STRING={}'.format(components['backend'])
+        cmake_backend_arg(be, 'CMAKE_BUILD_TYPE', None, FLAGS.build_type),
+        cmake_backend_arg(be, 'CMAKE_INSTALL_PREFIX', 'PATH', install_dir),
+        cmake_backend_arg(be, 'TRITON_COMMON_REPO_TAG', 'STRING',
+                          components['common']),
+        cmake_backend_arg(be, 'TRITON_CORE_REPO_TAG', 'STRING',
+                          components['core']),
+        cmake_backend_arg(be, 'TRITON_BACKEND_REPO_TAG', 'STRING',
+                          components['backend'])
     ]
 
-    cargs.append('-DTRITON_ENABLE_GPU:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_gpu)))
-    cargs.append('-DTRITON_ENABLE_MALI_GPU:BOOL={}'.format(
-        cmake_enable(FLAGS.enable_mali_gpu)))
+    cargs.append(cmake_backend_enable(be, 'TRITON_ENABLE_GPU',
+                                      FLAGS.enable_gpu))
+    cargs.append(
+        cmake_backend_enable(be, 'TRITON_ENABLE_MALI_GPU',
+                             FLAGS.enable_mali_gpu))
+    cargs.append(
+        cmake_backend_enable(be, 'TRITON_ENABLE_STATS', FLAGS.enable_stats))
 
     # If TRITONBUILD_* is defined in the env then we use it to set
     # corresponding cmake value.
     for evar, eval in os.environ.items():
         if evar.startswith('TRITONBUILD_'):
-            cargs.append('-D{}={}'.format(evar[len('TRITONBUILD_'):], eval))
+            cargs.append(
+                cmake_backend_arg(be, evar[len('TRITONBUILD_'):], None, eval))
 
+    cargs += cmake_backend_extra_args(be)
     cargs.append('..')
     return cargs
 
 
 def pytorch_cmake_args(images):
-    if "pytorch" in images:
-        image = images["pytorch"]
+
+    # If platform is jetpack do not use docker based build
+    if target_platform() == 'jetpack':
+        pt_lib_path = library_paths['pytorch'] + "/lib"
+        pt_include_paths = ""
+        for suffix in [
+                'include/torch', 'include/torch/torch/csrc/api/include',
+                'include/torchvision'
+        ]:
+            pt_include_paths += library_paths['pytorch'] + '/' + suffix + ';'
+        cargs = [
+            cmake_backend_arg('pytorch', 'TRITON_PYTORCH_INCLUDE_PATHS', None,
+                              pt_include_paths),
+            cmake_backend_arg('pytorch', 'TRITON_PYTORCH_LIB_PATHS', None,
+                              pt_lib_path),
+        ]
     else:
-        image = 'nvcr.io/nvidia/pytorch:{}-py3'.format(
-            FLAGS.upstream_container_version)
-    return [
-        '-DTRITON_PYTORCH_DOCKER_IMAGE={}'.format(image),
-    ]
+        if "pytorch" in images:
+            image = images["pytorch"]
+        else:
+            image = 'nvcr.io/nvidia/pytorch:{}-py3'.format(
+                FLAGS.upstream_container_version)
+        cargs = [
+            cmake_backend_arg('pytorch', 'TRITON_PYTORCH_DOCKER_IMAGE', None,
+                              image),
+        ]
+
+        if FLAGS.enable_gpu:
+            cargs.append(
+                cmake_backend_enable('pytorch',
+                                     'TRITON_PYTORCH_ENABLE_TORCHTRT', True))
+    return cargs
 
 
 def onnxruntime_cmake_args(images, library_paths):
     cargs = [
-        '-DTRITON_BUILD_ONNXRUNTIME_VERSION={}'.format(
-            TRITON_VERSION_MAP[FLAGS.version][2])
+        cmake_backend_arg('onnxruntime', 'TRITON_BUILD_ONNXRUNTIME_VERSION',
+                          None, TRITON_VERSION_MAP[FLAGS.version][2])
     ]
+
+    # TRITON_ENABLE_GPU is already set for all backends in backend_cmake_args()
     if FLAGS.enable_gpu:
-        cargs.append('-DTRITON_ENABLE_ONNXRUNTIME_TENSORRT=ON')
-    else:
-        cargs.append('-DTRITON_ENABLE_GPU=OFF')
+        cargs.append(
+            cmake_backend_enable('onnxruntime',
+                                 'TRITON_ENABLE_ONNXRUNTIME_TENSORRT', True))
 
     # If platform is jetpack do not use docker based build
     if target_platform() == 'jetpack':
         ort_lib_path = library_paths['onnxruntime'] + "/lib"
         ort_include_path = library_paths['onnxruntime'] + "/include"
         cargs += [
-            '-DTRITON_ONNXRUNTIME_INCLUDE_PATHS={}'.format(ort_include_path),
-            '-DTRITON_ONNXRUNTIME_LIB_PATHS={}'.format(ort_lib_path),
-            '-DTRITON_ENABLE_ONNXRUNTIME_OPENVINO=OFF'
+            cmake_backend_arg('onnxruntime', 'TRITON_ONNXRUNTIME_INCLUDE_PATHS',
+                              None, ort_include_path),
+            cmake_backend_arg('onnxruntime', 'TRITON_ONNXRUNTIME_LIB_PATHS',
+                              None, ort_lib_path),
+            cmake_backend_enable('onnxruntime',
+                                 'TRITON_ENABLE_ONNXRUNTIME_OPENVINO', False)
         ]
     else:
         if target_platform() == 'windows':
             if 'base' in images:
-                cargs.append('-DTRITON_BUILD_CONTAINER={}'.format(
-                    images['base']))
+                cargs.append(
+                    cmake_backend_arg('onnxruntime', 'TRITON_BUILD_CONTAINER',
+                                      None, images['base']))
         else:
             if 'base' in images:
-                cargs.append('-DTRITON_BUILD_CONTAINER={}'.format(
-                    images['base']))
+                cargs.append(
+                    cmake_backend_arg('onnxruntime', 'TRITON_BUILD_CONTAINER',
+                                      None, images['base']))
             else:
-                cargs.append('-DTRITON_BUILD_CONTAINER_VERSION={}'.format(
-                    TRITON_VERSION_MAP[FLAGS.version][1]))
+                cargs.append(
+                    cmake_backend_arg('onnxruntime',
+                                      'TRITON_BUILD_CONTAINER_VERSION', None,
+                                      TRITON_VERSION_MAP[FLAGS.version][1]))
 
             if ((target_machine() != 'aarch64') and
                 (TRITON_VERSION_MAP[FLAGS.version][3] is not None)):
-                cargs.append('-DTRITON_ENABLE_ONNXRUNTIME_OPENVINO=ON')
                 cargs.append(
-                    '-DTRITON_BUILD_ONNXRUNTIME_OPENVINO_VERSION={}'.format(
+                    cmake_backend_enable('onnxruntime',
+                                         'TRITON_ENABLE_ONNXRUNTIME_OPENVINO',
+                                         True))
+                cargs.append(
+                    cmake_backend_arg(
+                        'onnxruntime',
+                        'TRITON_BUILD_ONNXRUNTIME_OPENVINO_VERSION', None,
                         TRITON_VERSION_MAP[FLAGS.version][3]))
 
     return cargs
 
 
-def openvino_cmake_args():
+def openvino_cmake_args(be, variant_index):
+    ov_version = TRITON_VERSION_MAP[FLAGS.version][4][variant_index][1]
+    if ov_version:
+        use_prebuilt_ov = True
+    else:
+        # If the OV package version is None, then we are not using prebuilt package
+        ov_version = TRITON_VERSION_MAP[FLAGS.version][4][variant_index][0]
+        use_prebuilt_ov = False
     cargs = [
-        '-DTRITON_BUILD_OPENVINO_VERSION={}'.format(
-            TRITON_VERSION_MAP[FLAGS.version][4]),
+        cmake_backend_arg(be, 'TRITON_BUILD_OPENVINO_VERSION', None,
+                          ov_version),
     ]
-
+    cargs.append(
+        cmake_backend_arg(be, 'TRITON_OPENVINO_BACKEND_INSTALLDIR', None, be))
     if target_platform() == 'windows':
         if 'base' in images:
-            cargs.append('-DTRITON_BUILD_CONTAINER={}'.format(images['base']))
+            cargs.append(
+                cmake_backend_arg(be, 'TRITON_BUILD_CONTAINER', None,
+                                  images['base']))
     else:
         if 'base' in images:
-            cargs.append('-DTRITON_BUILD_CONTAINER={}'.format(images['base']))
+            cargs.append(
+                cmake_backend_arg(be, 'TRITON_BUILD_CONTAINER', None,
+                                  images['base']))
         else:
-            cargs.append('-DTRITON_BUILD_CONTAINER_VERSION={}'.format(
-                TRITON_VERSION_MAP[FLAGS.version][1]))
-
+            cargs.append(
+                cmake_backend_arg(be, 'TRITON_BUILD_CONTAINER_VERSION', None,
+                                  TRITON_VERSION_MAP[FLAGS.version][1]))
+        cargs.append(
+            cmake_backend_enable(be, 'TRITON_BUILD_USE_PREBUILT_OPENVINO',
+                                 use_prebuilt_ov))
     return cargs
 
 
 def tensorrt_cmake_args():
     cargs = [
-        '-DTRITON_ENABLE_NVTX:BOOL={}'.format(cmake_enable(FLAGS.enable_nvtx))
+        cmake_backend_enable('tensorrt', 'TRITON_ENABLE_NVTX',
+                             FLAGS.enable_nvtx),
     ]
     if target_platform() == 'windows':
-        cargs.append('-DTRITON_TENSORRT_INCLUDE_PATHS=c:/TensorRT/include')
+        cargs.append(
+            cmake_backend_arg('tensorrt', 'TRITON_TENSORRT_INCLUDE_PATHS', None,
+                              'c:/TensorRT/include'))
 
     return cargs
 
@@ -488,8 +669,8 @@ def tensorflow_cmake_args(ver, images, library_paths):
     if target_platform() == 'jetpack':
         if backend_name in library_paths:
             extra_args = [
-                '-DTRITON_TENSORFLOW_LIB_PATHS={}'.format(
-                    library_paths[backend_name])
+                cmake_backend_arg(backend_name, 'TRITON_TENSORFLOW_LIB_PATHS',
+                                  None, library_paths[backend_name])
             ]
     else:
         # If a specific TF image is specified use it, otherwise pull from NGC.
@@ -498,19 +679,39 @@ def tensorflow_cmake_args(ver, images, library_paths):
         else:
             image = 'nvcr.io/nvidia/tensorflow:{}-tf{}-py3'.format(
                 FLAGS.upstream_container_version, ver)
-        extra_args = ['-DTRITON_TENSORFLOW_DOCKER_IMAGE={}'.format(image)]
-    return ['-DTRITON_TENSORFLOW_VERSION={}'.format(ver)] + extra_args
+        extra_args = [
+            cmake_backend_arg(backend_name, 'TRITON_TENSORFLOW_DOCKER_IMAGE',
+                              None, image)
+        ]
+    return [
+        cmake_backend_arg(backend_name, 'TRITON_TENSORFLOW_VERSION', None, ver)
+    ] + extra_args
 
 
 def dali_cmake_args():
     return [
-        '-DTRITON_DALI_SKIP_DOWNLOAD=OFF',
+        cmake_backend_enable('dali', 'TRITON_DALI_SKIP_DOWNLOAD', False),
     ]
+
+
+def fil_cmake_args(images):
+    cargs = [cmake_backend_enable('fil', 'TRITON_FIL_DOCKER_BUILD', True)]
+    if 'base' in images:
+        cargs.append(
+            cmake_backend_arg('fil', 'TRITON_BUILD_CONTAINER', None,
+                              images['base']))
+    else:
+        cargs.append(
+            cmake_backend_arg('fil', 'TRITON_BUILD_CONTAINER_VERSION', None,
+                              TRITON_VERSION_MAP[FLAGS.version][1]))
+
+    return cargs
 
 
 def armnn_tflite_cmake_args():
     return [
-        '-DJOBS={}'.format(multiprocessing.cpu_count()),
+        cmake_backend_arg('armnn_tflite', 'JOBS', None,
+                          multiprocessing.cpu_count()),
     ]
 
 
@@ -541,17 +742,6 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86
     add-apt-repository "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/ /" && \
     apt-get update && apt-get install -y datacenter-gpu-manager=1:{}
 '''.format(dcgm_version, dcgm_version)
-
-
-def fil_cmake_args(images):
-    cargs = ['-DTRITON_FIL_DOCKER_BUILD=ON']
-    if 'base' in images:
-        cargs.append('-DTRITON_BUILD_CONTAINER={}'.format(images['base']))
-    else:
-        cargs.append('-DTRITON_BUILD_CONTAINER_VERSION={}'.format(
-            TRITON_VERSION_MAP[FLAGS.version][1]))
-
-    return cargs
 
 
 def get_container_versions(version, container_version,
@@ -679,7 +869,7 @@ COPY --from=build /tmp/tritonbuild /tmp/tritonbuild
     # Triton Windows is not delivered as a container (and tar not
     # available) so skip for windows platform.
     if target_platform() != 'windows':
-        if not FLAGS.no_container_source:
+        if not FLAGS.no_core_build and not FLAGS.no_container_source:
             df += '''
 RUN mkdir -p /tmp/tritonbuild/install/third-party-src && \
     (cd /tmp/tritonbuild/tritonserver/build && \
@@ -734,6 +924,10 @@ WORKDIR /opt/tritonserver
 COPY --chown=1000:1000 LICENSE .
 COPY --chown=1000:1000 TRITON_VERSION .
 COPY --chown=1000:1000 NVIDIA_Deep_Learning_Container_License.pdf .
+'''
+
+    if not FLAGS.no_core_build:
+        df += '''
 COPY --chown=1000:1000 --from=tritonserver_build /tmp/tritonbuild/install/bin/tritonserver bin/
 COPY --chown=1000:1000 --from=tritonserver_build /tmp/tritonbuild/install/lib/libtritonserver.so lib/
 COPY --chown=1000:1000 --from=tritonserver_build /tmp/tritonbuild/install/include/triton/core include/triton/core
@@ -743,10 +937,17 @@ COPY --chown=1000:1000 --from=tritonserver_build /tmp/tritonbuild/install/includ
 RUN chown -R triton-server:triton-server include
 '''
 
-    # If requested, include the source code for all OSS used to build Triton
-    if not FLAGS.no_container_source:
-        df += '''
+        # If requested, include the source code for all OSS used to build Triton
+        if not FLAGS.no_container_source:
+            df += '''
 COPY --chown=1000:1000 --from=tritonserver_build /tmp/tritonbuild/install/third-party-src third-party-src
+'''
+
+        # Add feature labels for SageMaker endpoint
+        if 'sagemaker' in endpoints:
+            df += '''
+LABEL com.amazonaws.sagemaker.capabilities.accept-bind-to-port=true
+COPY --chown=1000:1000 --from=tritonserver_build /workspace/build/sagemaker/serve /usr/bin/.
 '''
 
     for noncore in NONCORE_BACKENDS:
@@ -760,12 +961,7 @@ COPY --chown=1000:1000 --from=tritonserver_build /tmp/tritonbuild/install/backen
         df += '''
 COPY --chown=1000:1000 --from=tritonserver_build /tmp/tritonbuild/install/repoagents repoagents
 '''
-    # Add feature labels for SageMaker endpoint
-    if 'sagemaker' in endpoints:
-        df += '''
-LABEL com.amazonaws.sagemaker.capabilities.accept-bind-to-port=true
-COPY --chown=1000:1000 --from=tritonserver_build /workspace/build/sagemaker/serve /usr/bin/.
-'''
+
     mkdir(ddir)
     with open(os.path.join(ddir, dockerfile_name), "w") as dfile:
         dfile.write(df)
@@ -787,12 +983,16 @@ LABEL com.nvidia.tritonserver.version="${TRITON_SERVER_VERSION}"
 ENV PATH /opt/tritonserver/bin:${PATH}
 '''
     ort_dependencies = "libgomp1" if 'onnxruntime' in backends else ""
+    pytorch_dependencies = ""
+    if ('pytorch' in backends) and (target_machine == 'aarch64'):
+        pytorch_dependencies = "libgfortran5"
+
     df += '''
 ENV TF_ADJUST_HUE_FUSED         1
 ENV TF_ADJUST_SATURATION_FUSED  1
 ENV TF_ENABLE_WINOGRAD_NONFUSED 1
 ENV TF_AUTOTUNE_THRESHOLD       2
-ENV TRITON_SERVER_GPU_ENABLED    {gpu_enabled}        
+ENV TRITON_SERVER_GPU_ENABLED    {gpu_enabled}
 
 # Create a user that can be used to run triton as
 # non-root. Make sure that this user to given ID 1000. All server
@@ -820,9 +1020,11 @@ RUN apt-get update && \
             dirmngr \
             libnuma-dev \
             curl \
-            {ort_dependencies} && \
+            {ort_dependencies} {pytorch_dependencies} && \
     rm -rf /var/lib/apt/lists/*
-'''.format(gpu_enabled=gpu_enabled, ort_dependencies=ort_dependencies)
+'''.format(gpu_enabled=gpu_enabled,
+           ort_dependencies=ort_dependencies,
+           pytorch_dependencies=pytorch_dependencies)
 
     if enable_gpu:
         df += install_dcgm_libraries(argmap['DCGM_VERSION'], target_machine)
@@ -944,9 +1146,11 @@ def container_build(images, backends, repoagents, endpoints):
         base_image = images['base']
     elif target_platform() == 'windows':
         base_image = 'mcr.microsoft.com/dotnet/framework/sdk:4.8'
-    else:
+    elif FLAGS.enable_gpu:
         base_image = 'nvcr.io/nvidia/tritonserver:{}-py3-min'.format(
             FLAGS.upstream_container_version)
+    else:
+        base_image = 'ubuntu:20.04'
 
     dockerfileargmap = {
         'NVIDIA_BUILD_REF':
@@ -994,6 +1198,45 @@ def container_build(images, backends, repoagents, endpoints):
                              ['-t', 'tritonserver_buildbase', '.'])
         p.wait()
         fail_if(p.returncode != 0, 'docker build tritonserver_buildbase failed')
+
+        # Need to extract env from the base image so that we can
+        # access library versions.
+        buildbase_env_filepath = os.path.join(FLAGS.build_dir, 'buildbase_env')
+        with open(buildbase_env_filepath, 'w') as f:
+            if target_platform() == 'windows':
+                envargs = [
+                    'docker', 'run', '--rm', 'tritonserver_buildbase',
+                    'cmd.exe', '/c', 'set'
+                ]
+            else:
+                envargs = [
+                    'docker', 'run', '--rm', 'tritonserver_buildbase', 'env'
+                ]
+            log_verbose('buildbase env {}'.format(envargs))
+            p = subprocess.Popen(envargs, stdout=f)
+            p.wait()
+            fail_if(p.returncode != 0,
+                    'extracting tritonserver_buildbase env failed')
+
+        buildbase_env = {}
+        with open(buildbase_env_filepath, 'r') as f:
+            for line in f:
+                kv = line.strip().split('=', 1)
+                if len(kv) == 2:
+                    key, value = kv
+                    buildbase_env[key] = value
+
+        # We set the following env in the build docker container
+        # launch below to pass necessary versions into the build. By
+        # prepending the envvars with TRITONBUILD_ prefix we indicate
+        # that the build.py execution within the container should set
+        # the corresponding variables in cmake invocation.
+        dockerrunenvargs = []
+        for k in ['TRT_VERSION', 'DALI_VERSION']:
+            if k in buildbase_env:
+                dockerrunenvargs += [
+                    '--env', 'TRITONBUILD_{}={}'.format(k, buildbase_env[k])
+                ]
 
         # Before attempting to run the new image, make sure any
         # previous 'tritonserver_builder' container is removed.
@@ -1055,6 +1298,7 @@ def container_build(images, backends, repoagents, endpoints):
             ]
         else:
             dockerrunargs += ['-v', '/var/run/docker.sock:/var/run/docker.sock']
+        dockerrunargs += dockerrunenvargs
         dockerrunargs += [
             'tritonserver_buildbase',
         ]
@@ -1081,7 +1325,7 @@ def container_build(images, backends, repoagents, endpoints):
         #untar(FLAGS.install_dir, tarfilename)
 
         # Build is complete, save the container as the
-        # tritonserver_build image. We must to this in two steps:
+        # tritonserver_build image. We must do this in two steps:
         #
         #   1. Commit the container as image
         #   "tritonserver_builder_image". This image can't be used
@@ -1129,6 +1373,42 @@ def container_build(images, backends, repoagents, endpoints):
     except Exception as e:
         logging.error(traceback.format_exc())
         fail('container build failed')
+
+
+def build_backend(be,
+                  tag,
+                  build_dir,
+                  install_dir,
+                  github_organization,
+                  images,
+                  components,
+                  library_paths,
+                  variant_index=0):
+    repo_build_dir = os.path.join(build_dir, be, 'build')
+    repo_install_dir = os.path.join(build_dir, be, 'install')
+
+    mkdir(build_dir)
+    gitclone(build_dir, backend_repo(be), tag, be, github_organization)
+    mkdir(repo_build_dir)
+    cmake(
+        repo_build_dir,
+        backend_cmake_args(images, components, be, repo_install_dir,
+                           library_paths, variant_index))
+    makeinstall(repo_build_dir)
+
+    backend_install_dir = os.path.join(install_dir, 'backends', be)
+    rmdir(backend_install_dir)
+    mkdir(backend_install_dir)
+    cpdir(os.path.join(repo_install_dir, 'backends', be), backend_install_dir)
+
+
+def get_tagged_backend(be, version):
+    tagged_be = be
+    if be == 'openvino':
+        tagged_be += "_" + version[0].replace('.', '_')
+        if version[1] and target_platform() != 'windows':
+            tagged_be += "_pre"
+    return tagged_be
 
 
 if __name__ == '__main__':
@@ -1318,7 +1598,7 @@ if __name__ == '__main__':
         action='append',
         required=False,
         help=
-        'Include specified endpoint in build. Allowed values are "grpc", "http" and "sagemaker".'
+        'Include specified endpoint in build. Allowed values are "grpc", "http", "vertex-ai" and "sagemaker".'
     )
     parser.add_argument(
         '--filesystem',
@@ -1336,27 +1616,62 @@ if __name__ == '__main__':
         action='append',
         required=False,
         help=
-        'Include specified backend in build as <backend-name>[:<repo-tag>]. If <repo-tag> starts with "pull/" then it refers to a pull-request reference, otherwise <repo-tag> indicates the git tag/branch to use for the build. If the version is non-development then the default <repo-tag> is the release branch matching the container version (e.g. version 21.09 -> branch r21.09); otherwise the default <repo-tag> is "main" (e.g. version 21.09dev -> branch main).'
+        'Include specified backend in build as <backend-name>[:<repo-tag>]. If <repo-tag> starts with "pull/" then it refers to a pull-request reference, otherwise <repo-tag> indicates the git tag/branch to use for the build. If the version is non-development then the default <repo-tag> is the release branch matching the container version (e.g. version 21.11 -> branch r21.11); otherwise the default <repo-tag> is "main" (e.g. version 21.11dev -> branch main).'
+    )
+    parser.add_argument(
+        '--build-multiple-openvino',
+        action="store_true",
+        default=False,
+        help=
+        'Build multiple openVINO versions as specified in TRITON_VERSION_MAP. Be aware that loading backends with different openvino versions simultaneously in triton can cause conflicts'
     )
     parser.add_argument(
         '--repo-tag',
         action='append',
         required=False,
         help=
-        'The version of a component to use in the build as <component-name>:<repo-tag>. <component-name> can be "common", "core", "backend" or "thirdparty". If <repo-tag> starts with "pull/" then it refers to a pull-request reference, otherwise <repo-tag> indicates the git tag/branch. If the version is non-development then the default <repo-tag> is the release branch matching the container version (e.g. version 21.09 -> branch r21.09); otherwise the default <repo-tag> is "main" (e.g. version 21.09dev -> branch main).'
+        'The version of a component to use in the build as <component-name>:<repo-tag>. <component-name> can be "common", "core", "backend" or "thirdparty". If <repo-tag> starts with "pull/" then it refers to a pull-request reference, otherwise <repo-tag> indicates the git tag/branch. If the version is non-development then the default <repo-tag> is the release branch matching the container version (e.g. version 21.11 -> branch r21.11); otherwise the default <repo-tag> is "main" (e.g. version 21.11dev -> branch main).'
     )
     parser.add_argument(
         '--repoagent',
         action='append',
         required=False,
         help=
-        'Include specified repo agent in build as <repoagent-name>[:<repo-tag>]. If <repo-tag> starts with "pull/" then it refers to a pull-request reference, otherwise <repo-tag> indicates the git tag/branch to use for the build. If the version is non-development then the default <repo-tag> is the release branch matching the container version (e.g. version 21.09 -> branch r21.09); otherwise the default <repo-tag> is "main" (e.g. version 21.09dev -> branch main).'
+        'Include specified repo agent in build as <repoagent-name>[:<repo-tag>]. If <repo-tag> starts with "pull/" then it refers to a pull-request reference, otherwise <repo-tag> indicates the git tag/branch to use for the build. If the version is non-development then the default <repo-tag> is the release branch matching the container version (e.g. version 21.11 -> branch r21.11); otherwise the default <repo-tag> is "main" (e.g. version 21.11dev -> branch main).'
     )
     parser.add_argument(
         '--no-force-clone',
         action="store_true",
         default=False,
         help='Do not create fresh clones of repos that have already been cloned.'
+    )
+    parser.add_argument(
+        '--extra-core-cmake-arg',
+        action='append',
+        required=False,
+        help=
+        'Extra CMake argument as <name>=<value>. The argument is passed to CMake as -D<name>=<value> and is included after all CMake arguments added by build.py for the core builds.'
+    )
+    parser.add_argument(
+        '--override-core-cmake-arg',
+        action='append',
+        required=False,
+        help=
+        'Override specified CMake argument in the build as <name>=<value>. The argument is passed to CMake as -D<name>=<value>. This flag only impacts CMake arguments that are used by build.py. To unconditionally add a CMake argument to the core build use --extra-core-cmake-arg.'
+    )
+    parser.add_argument(
+        '--extra-backend-cmake-arg',
+        action='append',
+        required=False,
+        help=
+        'Extra CMake argument for a backend build as <backend>:<name>=<value>. The argument is passed to CMake as -D<name>=<value> and is included after all CMake arguments added by build.py for the backend.'
+    )
+    parser.add_argument(
+        '--override-backend-cmake-arg',
+        action='append',
+        required=False,
+        help=
+        'Override specified backend CMake argument in the build as <backend>:<name>=<value>. The argument is passed to CMake as -D<name>=<value>. This flag only impacts CMake arguments that are used by build.py. To unconditionally add a CMake argument to the backend build use --extra-backend-cmake-arg.'
     )
 
     FLAGS = parser.parse_args()
@@ -1375,6 +1690,14 @@ if __name__ == '__main__':
         FLAGS.repoagent = []
     if FLAGS.library_paths is None:
         FLAGS.library_paths = []
+    if FLAGS.extra_core_cmake_arg is None:
+        FLAGS.extra_core_cmake_arg = []
+    if FLAGS.override_core_cmake_arg is None:
+        FLAGS.override_core_cmake_arg = []
+    if FLAGS.override_backend_cmake_arg is None:
+        FLAGS.override_backend_cmake_arg = []
+    if FLAGS.extra_backend_cmake_arg is None:
+        FLAGS.extra_backend_cmake_arg = []
 
     # FLAGS.cmake_dir is required for non-container builds. For
     # container builds it is set above to the value appropriate for
@@ -1444,7 +1767,7 @@ if __name__ == '__main__':
         parts = img.split(',')
         fail_if(
             len(parts) != 2,
-            '--image must specific <image-name>,<full-image-registry>')
+            '--image must specify <image-name>,<full-image-registry>')
         fail_if(
             parts[0] not in ['base', 'pytorch', 'tensorflow1', 'tensorflow2'],
             'unsupported value for --image')
@@ -1458,6 +1781,65 @@ if __name__ == '__main__':
         if len(parts) == 2:
             log('backend "{}" library path "{}"'.format(parts[0], parts[1]))
             library_paths[parts[0]] = parts[1]
+
+    # Parse any explicitly specified cmake arguments
+    for cf in FLAGS.extra_core_cmake_arg:
+        parts = cf.split('=')
+        fail_if(
+            len(parts) != 2,
+            '--extra-core-cmake-arg must specify <name>=<value>')
+        log('CMake core extra "-D{}={}"'.format(parts[0], parts[1]))
+        EXTRA_CORE_CMAKE_FLAGS[parts[0]] = parts[1]
+
+    for cf in FLAGS.override_core_cmake_arg:
+        parts = cf.split('=')
+        fail_if(
+            len(parts) != 2,
+            '--override-core-cmake-arg must specify <name>=<value>')
+        log('CMake core override "-D{}={}"'.format(parts[0], parts[1]))
+        OVERRIDE_CORE_CMAKE_FLAGS[parts[0]] = parts[1]
+
+    for cf in FLAGS.extra_backend_cmake_arg:
+        parts = cf.split(':', 1)
+        fail_if(
+            len(parts) != 2,
+            '--extra-backend-cmake-arg must specify <backend>:<name>=<value>')
+        be = parts[0]
+        parts = parts[1].split('=', 1)
+        fail_if(
+            len(parts) != 2,
+            '--extra-backend-cmake-arg must specify <backend>:<name>=<value>')
+        fail_if(
+            be not in backends,
+            '--extra-backend-cmake-arg specifies backend "{}" which is not included in build'
+            .format(be))
+        log('backend "{}" CMake extra "-D{}={}"'.format(be, parts[0], parts[1]))
+        if be not in EXTRA_BACKEND_CMAKE_FLAGS:
+            EXTRA_BACKEND_CMAKE_FLAGS[be] = {}
+        EXTRA_BACKEND_CMAKE_FLAGS[be][parts[0]] = parts[1]
+
+    for cf in FLAGS.override_backend_cmake_arg:
+        parts = cf.split(':', 1)
+        fail_if(
+            len(parts) != 2,
+            '--override-backend-cmake-arg must specify <backend>:<name>=<value>'
+        )
+        be = parts[0]
+        parts = parts[1].split('=', 1)
+        fail_if(
+            len(parts) != 2,
+            '--override-backend-cmake-arg must specify <backend>:<name>=<value>'
+        )
+        parts = cf.split(':')
+        fail_if(
+            be not in backends,
+            '--override-backend-cmake-arg specifies backend "{}" which is not included in build'
+            .format(be))
+        log('backend "{}" CMake override "-D{}={}"'.format(
+            be, parts[0], parts[1]))
+        if be not in OVERRIDE_BACKEND_CMAKE_FLAGS:
+            OVERRIDE_BACKEND_CMAKE_FLAGS[be] = {}
+        OVERRIDE_BACKEND_CMAKE_FLAGS[be][parts[0]] = parts[1]
 
     # If --container-build is specified then we perform the actual
     # build within a build container and then from that create a
@@ -1492,7 +1874,7 @@ if __name__ == '__main__':
         parts = be.split(':')
         fail_if(
             len(parts) != 2,
-            '--repo-tag must specific <component-name>:<repo-tag>')
+            '--repo-tag must specify <component-name>:<repo-tag>')
         fail_if(
             parts[0] not in components,
             '--repo-tag <component-name> must be "common", "core", "backend", or "thirdparty"'
@@ -1523,29 +1905,33 @@ if __name__ == '__main__':
         if (be in CORE_BACKENDS):
             continue
 
-        repo_build_dir = os.path.join(FLAGS.build_dir, be, 'build')
-        repo_install_dir = os.path.join(FLAGS.build_dir, be, 'install')
-
-        mkdir(FLAGS.build_dir)
+        tagged_be_list = []
+        if (be == 'openvino'):
+            tagged_be_list.append(
+                get_tagged_backend(be, TRITON_VERSION_MAP[FLAGS.version][4][0]))
+            if (FLAGS.build_multiple_openvino):
+                skip = True
+                for ver in TRITON_VERSION_MAP[FLAGS.version][4]:
+                    if not skip:
+                        tagged_be_list.append(get_tagged_backend(be, ver))
+                    skip = False
         # If armnn_tflite backend, source from external repo for git clone
         if be == 'armnn_tflite':
-            gitclone(FLAGS.build_dir, backend_repo(be), backends[be], be,
-                     'https://gitlab.com/arm-research/smarter/')
+            github_organization = 'https://gitlab.com/arm-research/smarter/'
         else:
-            gitclone(FLAGS.build_dir, backend_repo(be), backends[be], be,
-                     FLAGS.github_organization)
-        mkdir(repo_build_dir)
-        cmake(
-            repo_build_dir,
-            backend_cmake_args(images, components, be, repo_install_dir,
-                               library_paths))
-        makeinstall(repo_build_dir)
+            github_organization = FLAGS.github_organization
 
-        backend_install_dir = os.path.join(FLAGS.install_dir, 'backends', be)
-        rmdir(backend_install_dir)
-        mkdir(backend_install_dir)
-        cpdir(os.path.join(repo_install_dir, 'backends', be),
-              backend_install_dir)
+        if not tagged_be_list:
+            build_backend(be, backends[be], FLAGS.build_dir, FLAGS.install_dir,
+                          github_organization, images, components,
+                          library_paths)
+        else:
+            variant_index = 0
+            for tagged_be in tagged_be_list:
+                build_backend(tagged_be, backends[be], FLAGS.build_dir,
+                              FLAGS.install_dir, github_organization, images,
+                              components, library_paths, variant_index)
+                variant_index += 1
 
     # Build each repo agent...
     for ra in repoagents:

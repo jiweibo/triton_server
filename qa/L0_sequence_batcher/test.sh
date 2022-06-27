@@ -103,7 +103,7 @@ source ../common/util.sh
 RET=0
 
 # If BACKENDS not specified, set to all
-BACKENDS=${BACKENDS:="graphdef savedmodel onnx plan custom"}
+BACKENDS=${BACKENDS:="graphdef savedmodel onnx plan libtorch custom"}
 export BACKENDS
 
 # If MODEL_TRIALS not specified set to 0 1 2 4 v
@@ -139,6 +139,18 @@ QUEUE_DELAY_TESTS=${QUEUE_DELAY_TESTS:="test_queue_delay_no_min_util \
 ENSEMBLES=${ENSEMBLES:="1"}
 export ENSEMBLES
 
+# If IMPLICIT_STATE not specified, set to 0
+IMPLICIT_STATE=${IMPLICIT_STATE:="0"}
+export IMPLICIT_STATE
+
+# If INITIAL_STATE_FILE is not specified, set to 0
+INITIAL_STATE_FILE=${INITIAL_STATE_FILE:="0"}
+export INITIAL_STATE_FILE
+
+# If INITIAL_STATE_ZERO is not specified, set to 0
+INITIAL_STATE_ZERO=${INITIAL_STATE_ZERO:="0"}
+export INITIAL_STATE_ZERO
+
 # Setup non-variable-size model repositories. The same models are in each
 # repository but they are configured as:
 #   models0 - four instances with non-batching model
@@ -160,27 +172,54 @@ function get_datatype () {
   echo $dtype
 }
 
+if [[ "$INITIAL_STATE_ZERO" == "1" && "$INITIAL_STATE_FILE" == "1" ]]; then
+  echo -e "\n***\n*** 'INITIAL_STATE_ZERO' and 'INITIAL_STATE_FILE' can't be enabled simultaneously. \n***"
+  exit 1
+fi
+
+FIXED_MODEL_REPOSITORY=''
+VAR_MODEL_REPOSITORY=''
+if [ "$IMPLICIT_STATE" == "1" ]; then
+  if [[ "$INITIAL_STATE_ZERO" == "0" && "$INITIAL_STATE_FILE" == "0" ]]; then
+    FIXED_MODEL_REPOSITORY="qa_sequence_implicit_model_repository"
+    VAR_MODEL_REPOSITORY="qa_variable_sequence_implicit_model_repository"
+  else
+    FIXED_MODEL_REPOSITORY="qa_sequence_initial_state_implicit_model_repository"
+    VAR_MODEL_REPOSITORY="qa_variable_sequence_initial_state_implicit_model_repository"
+  fi
+else
+  FIXED_MODEL_REPOSITORY="qa_sequence_model_repository"
+  VAR_MODEL_REPOSITORY="qa_variable_sequence_model_repository"
+fi
+
 MODELS=""
 for BACKEND in $BACKENDS; do
   if [[ $BACKEND == "custom" ]]; then
     MODELS="$MODELS ../custom_models/custom_sequence_int32"
   else
     DTYPES=$(get_datatype $BACKEND)
+
     for DTYPE in $DTYPES; do
-      MODELS="$MODELS $DATADIR/qa_sequence_model_repository/${BACKEND}_sequence_${DTYPE}"
+      MODELS="$MODELS $DATADIR/$FIXED_MODEL_REPOSITORY/${BACKEND}_sequence_${DTYPE}"
     done
 
     if [[ $BACKEND == "graphdef" ]]; then
-      MODELS="$MODELS $DATADIR/qa_sequence_model_repository/graphdef_sequence_int32"
+      MODELS="$MODELS $DATADIR/$FIXED_MODEL_REPOSITORY/${BACKEND}_sequence_graphdef_sequence_int32"
     fi
 
     if [ "$ENSEMBLES" == "1" ]; then
       for DTYPE in $DTYPES; do
-        MODELS="$MODELS $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_${BACKEND}_sequence_${DTYPE}"
+        MODELS="$MODELS $DATADIR/qa_ensemble_model_repository/$FIXED_MODEL_REPOSITORY/*_${BACKEND}_sequence_${DTYPE}"
       done
     fi
   fi
 done
+
+if [ "$INITIAL_STATE_FILE" == "1" ]; then
+  # Create the input_state_data file.
+  rm -rf input_state_data
+  echo -n -e "\\x64\\x00\\x00\\x00" > input_state_data
+fi
 
 for MODEL in $MODELS; do
   if [[ ! "$TEST_VALGRIND" -eq 1 ]]; then
@@ -226,6 +265,41 @@ for MODEL in $MODELS; do
   fi
 done
 
+# Adjust the model repository for reading initial state for implicit state from file
+if [ "$INITIAL_STATE_FILE" == "1" ]; then
+  for MODEL in $MODELS; do
+    if [[ ! "$TEST_VALGRIND" -eq 1 ]]; then
+      mkdir -p models1/$(basename $MODEL)/initial_state/ && cp input_state_data models1/$(basename $MODEL)/initial_state/ && \
+      (cd models1/$(basename $MODEL) && \
+        sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+
+      mkdir -p models2/$(basename $MODEL)/initial_state/ && cp input_state_data models2/$(basename $MODEL)/initial_state/ && \
+      (cd models2/$(basename $MODEL) && \
+        sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+
+      mkdir -p models4/$(basename $MODEL)/initial_state/ && cp input_state_data models4/$(basename $MODEL)/initial_state/ && \
+      (cd models4/$(basename $MODEL) && \
+        sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+
+      mkdir -p queue_delay_models/$(basename $MODEL)/initial_state/ && cp input_state_data queue_delay_models/$(basename $MODEL)/initial_state/ && \
+      (cd queue_delay_models/$(basename $MODEL) && \
+        sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+
+      mkdir -p queue_delay_models/$(basename $MODEL)_half/initial_state/ && cp input_state_data queue_delay_models/$(basename $MODEL)_half/initial_state/ && \
+      (cd queue_delay_models/$(basename $MODEL)_half && \
+        sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+
+      mkdir -p queue_delay_models/$(basename $MODEL)_full/initial_state/ && cp input_state_data queue_delay_models/$(basename $MODEL)_full/initial_state/ && \
+      (cd queue_delay_models/$(basename $MODEL)_full && \
+        sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+    else
+      mkdir -p queue_delay_models/$(basename $MODEL)_full/initial_state/ && cp input_state_data queue_delay_models/$(basename $MODEL)_full/initial_state/ && \
+       (cd queue_delay_models/$(basename $MODEL)_full && \
+         sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+    fi
+  done
+fi
+
 MODELS=""
 for BACKEND in $BACKENDS; do
   if [[ $BACKEND == "custom" ]]; then
@@ -233,20 +307,20 @@ for BACKEND in $BACKENDS; do
   else
     DTYPES=$(get_datatype $BACKEND)
     for DTYPE in $DTYPES; do
-      MODELS="$MODELS $DATADIR/qa_sequence_model_repository/${BACKEND}_nobatch_sequence_${DTYPE}"
+      MODELS="$MODELS $DATADIR/$FIXED_MODEL_REPOSITORY/${BACKEND}_nobatch_sequence_${DTYPE}"
     done
 
     if [[ $BACKEND == "graphdef" ]]; then
-      MODELS="$MODELS $DATADIR/qa_sequence_model_repository/graphdef_nobatch_sequence_int32"
+      MODELS="$MODELS $DATADIR/$FIXED_MODEL_REPOSITORY/graphdef_nobatch_sequence_int32"
     fi
 
     if [ "$ENSEMBLES" == "1" ]; then
       for DTYPE in $DTYPES; do
-      MODELS="$MODELS $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_${BACKEND}_nobatch_sequence_${DTYPE}"
+      MODELS="$MODELS $DATADIR/qa_ensemble_model_repository/$FIXED_MODEL_REPOSITORY/*_${BACKEND}_nobatch_sequence_${DTYPE}"
       done
 
       if [[ $BACKEND == "graphdef" ]]; then
-        MODELS="$MODELS $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/*_graphdef_nobatch_sequence_int32"
+        MODELS="$MODELS $DATADIR/qa_ensemble_model_repository/$FIXED_MODEL_REPOSITORY/*_graphdef_nobatch_sequence_int32"
       fi
     fi
   fi
@@ -257,6 +331,12 @@ for MODEL in $MODELS; do
         (cd models0/$(basename $MODEL) && \
             sed -i "s/kind: KIND_GPU/kind: KIND_GPU\\ncount: 4/" config.pbtxt && \
             sed -i "s/kind: KIND_CPU/kind: KIND_CPU\\ncount: 4/" config.pbtxt)
+
+    if [ "$INITIAL_STATE_FILE" == "1" ]; then
+        mkdir -p models0/$(basename $MODEL)/initial_state/ && cp input_state_data models0/$(basename $MODEL)/initial_state/ && \
+           (cd models0/$(basename $MODEL) && \
+            sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+    fi
 done
 
 # modelsv - one instance with batch-size 4
@@ -269,12 +349,12 @@ for BACKEND in $BACKENDS; do
   else
     DTYPES=$(get_datatype $BACKEND)
     for DTYPE in $DTYPES; do
-      MODELS="$MODELS $DATADIR/qa_variable_sequence_model_repository/${BACKEND}_sequence_${DTYPE}"
+      MODELS="$MODELS $DATADIR/${VAR_MODEL_REPOSITORY}/${BACKEND}_sequence_${DTYPE}"
     done
 
     if [ "$ENSEMBLES" == "1" ]; then
       for DTYPE in $DTYPES; do
-        MODELS="$MODELS $DATADIR/qa_ensemble_model_repository/qa_variable_sequence_model_repository/*_${BACKEND}_sequence_${DTYPE}"
+        MODELS="$MODELS $DATADIR/qa_ensemble_model_repository/${VAR_MODEL_REPOSITORY}/*_${BACKEND}_sequence_${DTYPE}"
         done
     fi
   fi
@@ -286,6 +366,12 @@ for MODEL in $MODELS; do
             sed -i "s/^max_batch_size:.*/max_batch_size: 4/" config.pbtxt && \
             sed -i "s/kind: KIND_GPU/kind: KIND_GPU\\ncount: 1/" config.pbtxt && \
             sed -i "s/kind: KIND_CPU/kind: KIND_CPU\\ncount: 1/" config.pbtxt)
+
+    if [ "$INITIAL_STATE_FILE" == "1" ]; then
+        mkdir -p modelsv/$(basename $MODEL)/initial_state/ && cp input_state_data modelsv/$(basename $MODEL)/initial_state/ && \
+           (cd modelsv/$(basename $MODEL) && \
+            sed -i "s/zero_data.*/data_file:\"input_state_data\"/" config.pbtxt)
+    fi
 done
 
 # Same test work on all models since they all have same total number
@@ -300,7 +386,7 @@ for model_trial in $MODEL_TRIALS; do
     MODEL_PATH=models${model_trial}
 
     if [ "$ENSEMBLES" == "1" ]; then
-      cp -r $DATADIR/qa_ensemble_model_repository/qa_sequence_model_repository/nop_* `pwd`/$MODEL_PATH/.
+      cp -r $DATADIR/qa_ensemble_model_repository/${FIXED_MODEL_REPOSITORY}/nop_* `pwd`/$MODEL_PATH/.
         create_nop_version_dir `pwd`/$MODEL_PATH
       # Must load identity backend on GPU to avoid cuda init delay during 1st run
       for NOP_MODEL in `pwd`/$MODEL_PATH/nop_*; do

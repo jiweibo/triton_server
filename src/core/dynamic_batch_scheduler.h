@@ -54,8 +54,7 @@ class DynamicBatchScheduler : public Scheduler {
       TritonModel* model, TritonModelInstance* model_instance, const int nice,
       const bool dynamic_batching_enabled, const int32_t max_batch_size,
       const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
-      const bool preserve_ordering,
-      const bool response_cache_enable,
+      const bool preserve_ordering, const bool response_cache_enable,
       const std::set<int32_t>& preferred_batch_sizes,
       const uint64_t max_queue_delay_microseconds,
       std::unique_ptr<Scheduler>* scheduler);
@@ -68,8 +67,7 @@ class DynamicBatchScheduler : public Scheduler {
       const bool dynamic_batching_enabled, const int32_t max_batch_size,
       const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
       const inference::ModelDynamicBatching& batcher_config,
-      const bool response_cache_enable,
-      std::unique_ptr<Scheduler>* scheduler);
+      const bool response_cache_enable, std::unique_ptr<Scheduler>* scheduler);
 
   ~DynamicBatchScheduler();
 
@@ -81,8 +79,7 @@ class DynamicBatchScheduler : public Scheduler {
       TritonModel* model, TritonModelInstance* model_instance,
       const bool dynamic_batching_enabled, const int32_t max_batch_size,
       const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
-      const bool preserve_ordering,
-      const bool response_cache_enable,
+      const bool preserve_ordering, const bool response_cache_enable,
       const std::set<int32_t>& preferred_batch_sizes,
       const uint64_t max_queue_delay_microseconds,
       const inference::ModelQueuePolicy& default_queue_policy,
@@ -98,7 +95,6 @@ class DynamicBatchScheduler : public Scheduler {
       std::unique_ptr<InferenceResponse>& cached_response);
   void FinalizeResponses();
 
-  // FIXME: Use shared_ptr for model once InferenceBackend class is cleaned up.
   TritonModel* model_;
   TritonModelInstance* model_instance_;
 
@@ -140,6 +136,9 @@ class DynamicBatchScheduler : public Scheduler {
   // contained in the shape tensor must match same tensor already in
   // the batch.
   const std::unordered_map<std::string, bool> enforce_equal_shape_tensors_;
+
+  // Store information on whether the model contains optional inputs.
+  bool has_optional_input_;
 
   // If true the ordering of responses matches the order of requests
   // even when there are multiple scheduler threads.

@@ -165,11 +165,31 @@ def validate_for_libtorch_model(input_dtype, output0_dtype, output1_dtype,
     return True
 
 
+def validate_for_paddle_model(input_dtype, output0_dtype, output1_dtype,
+                              input_shape, output0_shape, output1_shape):
+    """Return True if input and output dtypes are supported by a paddle model."""
+
+    # STRING and UINT16 data types are not supported currently
+    if (input_dtype == np.object_) or (output0_dtype == np.object_) or (output1_dtype == np.object_):
+        return False
+    if (input_dtype == np.uint16) or (output0_dtype == np.uint16) or (output1_dtype == np.uint16):
+        return False
+    # The cast op not supported int8
+    if (input_dtype == np.int8) or (output0_dtype == np.int8) or (output1_dtype == np.int8):
+        return False
+    # The cast op not supported int16
+    if (input_dtype == np.int16) or (output0_dtype == np.int16) or (output1_dtype == np.int16):
+        return False
+
+
+    return True
+
+
 def validate_for_openvino_model(input_dtype, output0_dtype, output1_dtype,
                                 input_shape, output0_shape, output1_shape):
     """Return True if input and output dtypes are supported by an OpenVino model."""
 
-    # float16 is not supported on CPU by OpenVino 
+    # float16 is not supported on CPU by OpenVino
     supported_datatypes = [np.int8, np.int32, np.float32]
     if not input_dtype in supported_datatypes:
         return False
@@ -180,7 +200,8 @@ def validate_for_openvino_model(input_dtype, output0_dtype, output1_dtype,
 
     # Return false if input dtype != output dtype and shape > 1 dims
     # https://github.com/openvinotoolkit/openvino/issues/7173
-    if ((output1_dtype != input_dtype) or (output0_dtype != input_dtype)) and len(input_shape) > 1:
+    if ((output1_dtype != input_dtype) or
+        (output0_dtype != input_dtype)) and len(input_shape) > 1:
         return False
 
     return True

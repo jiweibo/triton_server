@@ -48,7 +48,7 @@
 ##
 ############################################################################
 
-TRITON_VERSION=21.09
+TRITON_VERSION=21.11
 
 # ONNX. Use ONNX_OPSET 0 to use the default for ONNX version
 ONNX_VERSION=1.7.0
@@ -68,24 +68,31 @@ HOST_SRCDIR=/tmp/gen_srcdir
 HOST_DESTDIR=/tmp/$TRITON_VERSION/qa_model_repository
 HOST_VARDESTDIR=/tmp/$TRITON_VERSION/qa_variable_model_repository
 HOST_IDENTITYDESTDIR=/tmp/$TRITON_VERSION/qa_identity_model_repository
-HOST_SIGDEFDESTDIR=/tmp/$TRITON_VERSION/qa_tf_tag_sigdef_repository 
+HOST_SIGDEFDESTDIR=/tmp/$TRITON_VERSION/qa_tf_tag_sigdef_repository
 HOST_IDENTITYBIGDESTDIR=/tmp/$TRITON_VERSION/qa_identity_big_model_repository
 HOST_SHAPEDESTDIR=/tmp/$TRITON_VERSION/qa_shapetensor_model_repository
 HOST_RESHAPEDESTDIR=/tmp/$TRITON_VERSION/qa_reshape_model_repository
 HOST_SEQDESTDIR=/tmp/$TRITON_VERSION/qa_sequence_model_repository
 HOST_DYNASEQDESTDIR=/tmp/$TRITON_VERSION/qa_dyna_sequence_model_repository
+HOST_DYNASEQIMPLICITDESTDIR=/tmp/$TRITON_VERSION/qa_dyna_sequence_implicit_model_repository
 HOST_VARSEQDESTDIR=/tmp/$TRITON_VERSION/qa_variable_sequence_model_repository
 HOST_ENSEMBLEDESTDIR=/tmp/$TRITON_VERSION/qa_ensemble_model_repository
 HOST_NOSHAPEDESTDIR=/tmp/$TRITON_VERSION/qa_noshape_model_repository
 HOST_PLGDESTDIR=/tmp/$TRITON_VERSION/qa_trt_plugin_model_repository
 HOST_RAGGEDDESTDIR=/tmp/$TRITON_VERSION/qa_ragged_model_repository
 HOST_FORMATDESTDIR=/tmp/$TRITON_VERSION/qa_trt_format_model_repository
+HOST_IMPLICITSEQDESTDIR=/tmp/$TRITON_VERSION/qa_sequence_implicit_model_repository
+HOST_VARIMPLICITSEQDESTDIR=/tmp/$TRITON_VERSION/qa_variable_sequence_implicit_model_repository
+HOST_INITIALSTATEIMPLICITSEQDESTDIR=/tmp/$TRITON_VERSION/qa_sequence_initial_state_implicit_model_repository
+HOST_VARINITIALSTATEIMPLICITSEQDESTDIR=/tmp/$TRITON_VERSION/qa_sequence_variable_initial_state_implicit_model_repository
 
 rm -fr $HOST_SRCDIR $HOST_DESTDIR $HOST_VARDESTDIR
 rm -fr $HOST_IDENTITYDESTDIR $HOST_IDENTITYBIGDESTDIR $HOST_SHAPEDESTDIR $HOST_SIGDEFDESTDIR
 rm -fr $HOST_SEQDESTDIR $HOST_DYNASEQDESTDIR $HOST_VARSEQDESTDIR
 rm -fr $HOST_ENSEMBLEDESTDIR $HOST_NOSHAPEDESTDIR $HOST_RESHAPEDESTDIR
 rm -fr $HOST_PLGDESTDIR $HOST_RAGGEDDESTDIR $HOST_FORMATDESTDIR
+rm -rf $HOST_IMPLICITSEQDESTDIR $HOST_VARIMPLICITSEQDESTDIR $HOST_DYNASEQIMPLICITDESTDIR 
+rm -rf $HOST_VARINITIALSTATEIMPLICITSEQDESTDIR $HOST_INITIALSTATEIMPLICITSEQDESTDIR
 mkdir -p $HOST_SRCDIR
 mkdir -p $HOST_DESTDIR
 mkdir -p $HOST_VARDESTDIR
@@ -96,12 +103,17 @@ mkdir -p $HOST_SHAPEDESTDIR
 mkdir -p $HOST_RESHAPEDESTDIR
 mkdir -p $HOST_SEQDESTDIR
 mkdir -p $HOST_DYNASEQDESTDIR
+mkdir -p $HOST_DYNASEQIMPLICITDESTDIR
 mkdir -p $HOST_VARSEQDESTDIR
 mkdir -p $HOST_ENSEMBLEDESTDIR
 mkdir -p $HOST_NOSHAPEDESTDIR
 mkdir -p $HOST_PLGDESTDIR
 mkdir -p $HOST_RAGGEDDESTDIR
 mkdir -p $HOST_FORMATDESTDIR
+mkdir -p $HOST_IMPLICITSEQDESTDIR
+mkdir -p $HOST_VARIMPLICITSEQDESTDIR
+mkdir -p $HOST_INITIALSTATEIMPLICITSEQDESTDIR
+mkdir -p $HOST_VARINITIALSTATEIMPLICITSEQDESTDIR
 
 # Since the models required by ensemble models may not be available
 # at this point, storing ensemble models separately so that other qa directories
@@ -121,7 +133,9 @@ cp ./gen_qa_identity_models.py $HOST_SRCDIR/.
 cp ./gen_qa_reshape_models.py $HOST_SRCDIR/.
 cp ./gen_qa_noshape_models.py $HOST_SRCDIR/.
 cp ./gen_qa_sequence_models.py $HOST_SRCDIR/.
+cp ./gen_qa_implicit_models.py $HOST_SRCDIR/.
 cp ./gen_qa_dyna_sequence_models.py $HOST_SRCDIR/.
+cp ./gen_qa_dyna_sequence_implicit_models.py $HOST_SRCDIR/.
 cp ./gen_ensemble_model_utils.py $HOST_SRCDIR/.
 cp ./gen_qa_trt_plugin_models.py $HOST_SRCDIR/.
 cp ./gen_qa_trt_format_models.py $HOST_SRCDIR/.
@@ -144,7 +158,12 @@ IDENTITYBIGDESTDIR=/tmp/zerobigmodels
 SHAPEDESTDIR=/tmp/shapetensormodels
 RESHAPEDESTDIR=/tmp/reshapemodels
 SEQDESTDIR=/tmp/seqmodels
+IMPLICITSEQDESTDIR=/tmp/implicitseqmodels
+INITIALSTATEIMPLICITSEQDESTDIR=/tmp/initialstateimplicitseqmodels
+VARIMPLICITSEQDESTDIR=/tmp/varimplicitseqmodels
+VARINITIALSTATEIMPLICITSEQDESTDIR=/tmp/varinitialstateimplicitseqmodels
 DYNASEQDESTDIR=/tmp/dynaseqmodels
+DYNASEQIMPLICITDESTDIR=/tmp/dynaseqimplicitmodels
 VARSEQDESTDIR=/tmp/varseqmodels
 ENSEMBLEDESTDIR=/tmp/ensemblemodels
 NOSHAPEDESTDIR=/tmp/noshapemodels
@@ -153,6 +172,10 @@ RAGGEDDESTDIR=/tmp/raggedmodels
 FORMATDESTDIR=/tmp/formatmodels
 
 # OPENVINO
+#
+# OpenVINO is not available on ARM so skip
+if [[ "aarch64" != $(uname -m) ]] ; then
+
 cat >$HOST_SRCDIR/$OPENVINOSCRIPT <<EOF
 #!/bin/bash
 set -e
@@ -213,6 +236,8 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+fi # [[ "aarch64" != $(uname -m) ]]
+
 # ONNX
 cat >$HOST_SRCDIR/$ONNXSCRIPT <<EOF
 #!/bin/bash
@@ -236,8 +261,18 @@ python3 $SRCDIR/gen_qa_sequence_models.py --onnx --onnx_opset=$ONNX_OPSET --mode
 chmod -R 777 $SEQDESTDIR
 python3 $SRCDIR/gen_qa_sequence_models.py --onnx --onnx_opset=$ONNX_OPSET --variable --models_dir=$VARSEQDESTDIR
 chmod -R 777 $VARSEQDESTDIR
+python3 $SRCDIR/gen_qa_implicit_models.py --onnx --initial-state zero --onnx_opset=$ONNX_OPSET --models_dir=$INITIALSTATEIMPLICITSEQDESTDIR
+chmod -R 777 $INITIALSTATEIMPLICITSEQDESTDIR
+python3 $SRCDIR/gen_qa_implicit_models.py --onnx --initial-state zero --onnx_opset=$ONNX_OPSET --variable --models_dir=$VARINITIALSTATEIMPLICITSEQDESTDIR
+chmod -R 777 $VARINITIALSTATEIMPLICITSEQDESTDIR
+python3 $SRCDIR/gen_qa_implicit_models.py --onnx --onnx_opset=$ONNX_OPSET --models_dir=$IMPLICITSEQDESTDIR
+chmod -R 777 $IMPLICITSEQDESTDIR
+python3 $SRCDIR/gen_qa_implicit_models.py --onnx --onnx_opset=$ONNX_OPSET --variable --models_dir=$VARIMPLICITSEQDESTDIR
+chmod -R 777 $VARIMPLICITSEQDESTDIR
 python3 $SRCDIR/gen_qa_dyna_sequence_models.py --onnx --onnx_opset=$ONNX_OPSET --models_dir=$DYNASEQDESTDIR
 chmod -R 777 $DYNASEQDESTDIR
+python3 $SRCDIR/gen_qa_dyna_sequence_implicit_models.py --onnx --onnx_opset=$ONNX_OPSET --models_dir=$DYNASEQIMPLICITDESTDIR
+chmod -R 777 $DYNASEQIMPLICITDESTDIR
 python3 $SRCDIR/gen_qa_ragged_models.py --onnx --onnx_opset=$ONNX_OPSET --models_dir=$RAGGEDDESTDIR
 chmod -R 777 $RAGGEDDESTDIR
 EOF
@@ -257,8 +292,13 @@ docker run --gpus device=$CUDA_DEVICE --rm --entrypoint $SRCDIR/$ONNXSCRIPT \
        --mount type=bind,source=$HOST_RESHAPEDESTDIR,target=$RESHAPEDESTDIR \
        --mount type=bind,source=$HOST_SEQDESTDIR,target=$SEQDESTDIR \
        --mount type=bind,source=$HOST_DYNASEQDESTDIR,target=$DYNASEQDESTDIR \
+       --mount type=bind,source=$HOST_DYNASEQIMPLICITDESTDIR,target=$DYNASEQIMPLICITDESTDIR \
        --mount type=bind,source=$HOST_VARSEQDESTDIR,target=$VARSEQDESTDIR \
        --mount type=bind,source=$HOST_RAGGEDDESTDIR,target=$RAGGEDDESTDIR \
+       --mount type=bind,source=$HOST_VARIMPLICITSEQDESTDIR,target=$VARIMPLICITSEQDESTDIR \
+       --mount type=bind,source=$HOST_IMPLICITSEQDESTDIR,target=$IMPLICITSEQDESTDIR \
+       --mount type=bind,source=$HOST_VARINITIALSTATEIMPLICITSEQDESTDIR,target=$VARINITIALSTATEIMPLICITSEQDESTDIR \
+       --mount type=bind,source=$HOST_INITIALSTATEIMPLICITSEQDESTDIR,target=$INITIALSTATEIMPLICITSEQDESTDIR \
        $UBUNTU_IMAGE
 if [ $? -ne 0 ]; then
     echo -e "Failed"
@@ -387,10 +427,14 @@ python3 $SRCDIR/gen_qa_reshape_models.py --tensorrt --variable --models_dir=$RES
 chmod -R 777 $RESHAPEDESTDIR
 python3 $SRCDIR/gen_qa_sequence_models.py --tensorrt --models_dir=$SEQDESTDIR
 chmod -R 777 $SEQDESTDIR
+python3 $SRCDIR/gen_qa_implicit_models.py --tensorrt --models_dir=$IMPLICITSEQDESTDIR
+chmod -R 777 $IMPLICITSEQDESTDIR
 python3 $SRCDIR/gen_qa_dyna_sequence_models.py --tensorrt --models_dir=$DYNASEQDESTDIR
 chmod -R 777 $DYNASEQDESTDIR
 python3 $SRCDIR/gen_qa_sequence_models.py --tensorrt --variable --models_dir=$VARSEQDESTDIR
 chmod -R 777 $VARSEQDESTDIR
+python3 $SRCDIR/gen_qa_dyna_sequence_implicit_models.py --tensorrt --models_dir=$DYNASEQIMPLICITDESTDIR
+chmod -R 777 $DYNASEQIMPLICITDESTDIR
 python3 $SRCDIR/gen_qa_ragged_models.py --tensorrt --models_dir=$RAGGEDDESTDIR
 chmod -R 777 $RAGGEDDESTDIR
 python3 $SRCDIR/gen_qa_trt_format_models.py --models_dir=$FORMATDESTDIR
@@ -423,6 +467,9 @@ docker run --gpus device=$CUDA_DEVICE --rm --entrypoint $SRCDIR/$TRTSCRIPT \
        --mount type=bind,source=$HOST_PLGDESTDIR,target=$PLGDESTDIR \
        --mount type=bind,source=$HOST_RAGGEDDESTDIR,target=$RAGGEDDESTDIR \
        --mount type=bind,source=$HOST_FORMATDESTDIR,target=$FORMATDESTDIR \
+       --mount type=bind,source=$HOST_VARIMPLICITSEQDESTDIR,target=$VARIMPLICITSEQDESTDIR \
+       --mount type=bind,source=$HOST_DYNASEQIMPLICITDESTDIR,target=$DYNASEQIMPLICITDESTDIR \
+       --mount type=bind,source=$HOST_IMPLICITSEQDESTDIR,target=$IMPLICITSEQDESTDIR \
        $TENSORRT_IMAGE
 if [ $? -ne 0 ]; then
     echo -e "Failed"

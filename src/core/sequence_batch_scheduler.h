@@ -40,6 +40,7 @@
 #include "src/core/rate_limiter.h"
 #include "src/core/scheduler.h"
 #include "src/core/scheduler_utils.h"
+#include "src/core/sequence_state.h"
 #include "src/core/status.h"
 
 namespace nvidia { namespace inferenceserver {
@@ -86,6 +87,20 @@ class SequenceBatchScheduler : public Scheduler {
   bool DelayScheduler(
       const uint32_t batcher_idx, const size_t cnt, const size_t total);
 
+  const std::unordered_map<
+      std::string, const inference::ModelSequenceBatching_State&>&
+  StateOutputConfigMap()
+  {
+    return state_output_config_map_;
+  }
+
+  size_t MaxBatchSize() { return max_batch_size_; }
+  const std::unordered_map<std::string, SequenceStates::InitialStateData>&
+  InitialState()
+  {
+    return initial_state_;
+  }
+
  private:
   void ReaperThread(const int nice);
 
@@ -97,7 +112,10 @@ class SequenceBatchScheduler : public Scheduler {
       std::shared_ptr<ControlInputs>* continue_input_overrides,
       std::shared_ptr<ControlInputs>* notready_input_overrides);
 
- private:
+  Status GenerateInitialStateData(
+      const inference::ModelSequenceBatching_InitialState& initial_state,
+      const inference::ModelSequenceBatching_State& state, TritonModel* model);
+
   struct BatcherSequenceSlotCompare {
     bool operator()(
         const BatcherSequenceSlot& a, const BatcherSequenceSlot& b) const
@@ -154,6 +172,15 @@ class SequenceBatchScheduler : public Scheduler {
   // Used for debugging/testing.
   size_t backlog_delay_cnt_;
   std::vector<size_t> queue_request_cnts_;
+
+  // IO mapping between the output state name and the state configuration.
+  std::unordered_map<std::string, const inference::ModelSequenceBatching_State&>
+      state_output_config_map_;
+  size_t max_batch_size_;
+
+  // Initial state used for implicit state.
+  std::unordered_map<std::string, SequenceStates::InitialStateData>
+      initial_state_;
 };
 
 // Base class for a scheduler that implements a particular scheduling
@@ -164,6 +191,7 @@ class SequenceBatch {
       SequenceBatchScheduler* base, const uint32_t batcher_idx,
       const size_t seq_slot_cnt,
       const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+      const bool has_optional_input,
       const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
           start_input_overrides,
       const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
@@ -191,6 +219,10 @@ class SequenceBatch {
       const InferenceRequest::SequenceId& corr_id,
       const bool not_ready = false);
 
+  // Update the implicit state and set the required input states.
+  void UpdateImplicitState(
+      std::unique_ptr<InferenceRequest>& irequest, const int32_t seq_slot);
+
   // The controlling scheduler.
   SequenceBatchScheduler* const base_;
 
@@ -209,6 +241,9 @@ class SequenceBatch {
   // the batch.
   const std::unordered_map<std::string, bool> enforce_equal_shape_tensors_;
 
+  // Store information on whether the model contains optional inputs.
+  bool has_optional_input_;
+
   // The control values, delivered as input tensors, that should be
   // used when starting a sequence, continuing a sequence, ending a
   // sequence, and showing that a sequence has not input available.
@@ -226,6 +261,9 @@ class SequenceBatch {
   // control.
   std::vector<std::shared_ptr<InferenceRequest::Input>>
       seq_slot_corrid_overrides_;
+
+  // For each sequence slot store the optional state i/o tensors.
+  std::vector<std::shared_ptr<SequenceStates>> sequence_states_;
 };
 
 // Scheduler that implements the Direct sequence scheduling strategy
@@ -236,6 +274,7 @@ class DirectSequenceBatch : public SequenceBatch {
       SequenceBatchScheduler* base, const uint32_t batcher_idx,
       const size_t seq_slot_cnt, TritonModelInstance* model_instance,
       const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+      const bool has_optional_input,
       const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
           start_input_overrides,
       const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
@@ -283,7 +322,7 @@ class DirectSequenceBatch : public SequenceBatch {
   std::vector<InferenceRequest::SequenceId> seq_slot_correlation_ids_;
 
   // The maximum active sequence slot. A value of -1 indicates that
-  // no slots are active in the backend.
+  // no slots are active in the model.
   int32_t max_active_seq_slot_;
 
   size_t max_batch_size_;
@@ -299,6 +338,7 @@ class OldestSequenceBatch : public SequenceBatch {
       SequenceBatchScheduler* base, const uint32_t batcher_idx,
       const size_t seq_slot_cnt, TritonModelInstance* model_instance,
       const std::unordered_map<std::string, bool>& enforce_equal_shape_tensors,
+      const bool has_optional_input,
       const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&
           start_input_overrides,
       const std::shared_ptr<SequenceBatchScheduler::ControlInputs>&

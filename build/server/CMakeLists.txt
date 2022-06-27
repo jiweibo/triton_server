@@ -122,6 +122,10 @@ if(${TRITON_ENABLE_SAGEMAKER})
   add_definitions(-DTRITON_ENABLE_SAGEMAKER=1)
 endif() # TRITON_ENABLE_SAGEMAKER
 
+if(${TRITON_ENABLE_VERTEX_AI})
+  add_definitions(-DTRITON_ENABLE_VERTEX_AI=1)
+endif() # TRITON_ENABLE_VERTEX_AI
+
 if(${TRITON_ENABLE_GRPC})
   add_definitions(-DTRITON_ENABLE_GRPC=1)
 endif() # TRITON_ENABLE_GRPC
@@ -214,7 +218,7 @@ include_directories(${Boost_INCLUDE_DIRS})
 #
 # libevent
 #
-if(${TRITON_ENABLE_HTTP} OR ${TRITON_ENABLE_METRICS} OR ${TRITON_ENABLE_SAGEMAKER})
+if(${TRITON_ENABLE_HTTP} OR ${TRITON_ENABLE_METRICS} OR ${TRITON_ENABLE_SAGEMAKER} OR ${TRITON_ENABLE_VERTEX_AI})
   find_package(Libevent CONFIG REQUIRED)
   message(STATUS "Using libevent ${Libevent_VERSION}")
   include_directories(${LIBEVENT_INCLUDE_DIRS})
@@ -249,8 +253,4 @@ endif() # TRITON_ENABLE_METRICS
 add_subdirectory(../../src/core src/core)
 add_subdirectory(../../src/backends/backend src/backends/backend)
 add_subdirectory(../../src/backends/ensemble src/backends/ensemble)
-add_subdirectory(../../src/backends/onnx src/backends/onnx)
-add_subdirectory(../../src/backends/pytorch src/backends/pytorch)
-add_subdirectory(../../src/backends/tensorflow src/backends/tensorflow)
-add_subdirectory(../../src/backends/tensorrt src/backends/tensorrt)
 add_subdirectory(../../src/servers src/servers)

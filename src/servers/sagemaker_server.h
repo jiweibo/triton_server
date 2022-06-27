@@ -1,4 +1,4 @@
-// Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+// Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -27,6 +27,8 @@
 
 #include "src/servers/http_server.h"
 
+#include "common.h"
+
 namespace nvidia { namespace inferenceserver {
 
 // Handle Sagemaker HTTP requests to inference server APIs
@@ -53,13 +55,6 @@ class SagemakerAPIServer : public HTTPAPIServer {
   };
 
  private:
-  static std::string GetEnvironmentVariableOrDefault(
-      const std::string& variable_name, const std::string& default_value)
-  {
-    const char* value = getenv(variable_name.c_str());
-    return value ? value : default_value;
-  }
-
   explicit SagemakerAPIServer(
       const std::shared_ptr<TRITONSERVER_Server>& server,
       nvidia::inferenceserver::TraceManager* trace_manager,
@@ -68,7 +63,7 @@ class SagemakerAPIServer : public HTTPAPIServer {
       : HTTPAPIServer(server, trace_manager, shm_manager, port, thread_cnt),
         ping_regex_(R"(/ping)"), invocations_regex_(R"(/invocations)"),
         ping_mode_("ready"),
-        model_name_(SagemakerAPIServer::GetEnvironmentVariableOrDefault(
+        model_name_(GetEnvironmentVariableOrDefault(
             "SAGEMAKER_TRITON_DEFAULT_MODEL_NAME",
             "unspecified_SAGEMAKER_TRITON_DEFAULT_MODEL_NAME")),
         model_version_str_("")

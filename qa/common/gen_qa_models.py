@@ -27,7 +27,6 @@
 import argparse
 from builtins import range
 import os
-import sys
 import numpy as np
 import gen_ensemble_model_utils as emu
 
@@ -150,6 +149,31 @@ def np_to_torch_dtype(np_dtype):
         return torch.double
     elif np_dtype == np_dtype_string:
         return None  # Not supported in Torch
+
+
+def np_to_paddle_dtype(np_dtype):
+    if np_dtype == bool:
+        return paddle.bool
+    elif np_dtype == np.int8:
+        return paddle.int8
+    elif np_dtype == np.int16:
+        return paddle.int16
+    elif np_dtype == np.int32:
+        return paddle.int32
+    elif np_dtype == np.int64:
+        return paddle.int64
+    elif np_dtype == np.uint8:
+        return paddle.uint8
+    elif np_dtype == np.uint16:
+        return None  # Not supported in Paddle
+    elif np_dtype == np.float16:
+        return paddle.float16
+    elif np_dtype == np.float32:
+        return paddle.float32
+    elif np_dtype == np.float64:
+        return paddle.float64
+    elif np_dtype == np_dtype_string:
+        return None  # Not supported in Paddle
 
 
 def create_graphdef_modelfile(models_dir,
@@ -574,8 +598,6 @@ def create_plan_dynamic_rf_modelfile(models_dir, max_batch, model_version,
     with open(model_version_dir + "/model.plan", "wb") as f:
         f.write(engine_bytes)
 
-    del builder
-
 
 def create_plan_dynamic_modelfile(models_dir, max_batch, model_version,
                                   input_shape, output0_shape, output1_shape,
@@ -712,8 +734,6 @@ def create_plan_dynamic_modelfile(models_dir, max_batch, model_version,
     with open(model_version_dir + "/model.plan", "wb") as f:
         f.write(engine_bytes)
 
-    del builder
-
 
 def create_plan_fixed_rf_modelfile(models_dir, max_batch, model_version,
                                    input_shape, output0_shape, output1_shape,
@@ -787,8 +807,6 @@ def create_plan_fixed_rf_modelfile(models_dir, max_batch, model_version,
     with open(model_version_dir + "/model.plan", "wb") as f:
         f.write(engine_bytes)
 
-    del builder
-
 
 def create_plan_fixed_modelfile(models_dir, max_batch, model_version,
                                 input_shape, output0_shape, output1_shape,
@@ -837,8 +855,6 @@ def create_plan_fixed_modelfile(models_dir, max_batch, model_version,
 
     with open(model_version_dir + "/model.plan", "wb") as f:
         f.write(engine_bytes)
-
-    del builder
 
 
 def create_plan_modelfile(models_dir,
@@ -1309,6 +1325,152 @@ output [
             lfile.write("label" + str(l) + "\n")
 
 
+def create_paddle_modelfile(models_dir,
+                            max_batch,
+                            model_version,
+                            input_shape,
+                            output0_shape,
+                            output1_shape,
+                            input_dtype,
+                            output0_dtype,
+                            output1_dtype,
+                            swap=False):
+
+    if not tu.validate_for_paddle_model(input_dtype, output0_dtype,
+                                        output1_dtype, input_shape,
+                                        output0_shape, output1_shape):
+        return
+
+    paddle_input_dtype = np_to_paddle_dtype(input_dtype)
+    paddle_output0_dtype = np_to_paddle_dtype(output0_dtype)
+    paddle_output1_dtype = np_to_paddle_dtype(output1_dtype)
+
+    model_name = tu.get_model_name(
+        "paddle_nobatch" if max_batch == 0 else "paddle", input_dtype,
+        output0_dtype, output1_dtype)
+    # Create the model
+    if not swap:
+
+        class AddSubNet(nn.Layer):
+
+            def __init__(self, *args):
+                self.paddle_output0_dtype = args[0][0]
+                self.paddle_output1_dtype = args[0][1]
+                super(AddSubNet, self).__init__()
+
+            def forward(self, input0, input1):
+                return paddle.cast(input0 + input1, self.paddle_output0_dtype), paddle.cast(input0 - input1, self.paddle_output1_dtype)
+
+        addSubModel = AddSubNet((paddle_output0_dtype, paddle_output1_dtype))
+        input_spec_x = InputSpec(input_shape, dtype=paddle_input_dtype, name="INPUT_0")
+        input_spec_y = InputSpec(input_shape, dtype=paddle_input_dtype, name="INPUT_1")
+        net = to_static(addSubModel, input_spec=[input_spec_x, input_spec_y])
+
+    else:
+
+        class SubAddNet(nn.Layer):
+
+            def __init__(self, *args):
+                self.paddle_output0_dtype = args[0][0]
+                self.paddle_output1_dtype = args[0][1]
+                super(SubAddNet, self).__init__()
+
+            def forward(self, input0, input1):
+                return paddle.cast(input0 - input1, self.paddle_output0_dtype), paddle.cast(input0 + input1, self.paddle_output1_dtype)
+
+        subAddModel = SubAddNet((paddle_output0_dtype, paddle_output1_dtype))
+        input_spec_x = InputSpec(input_shape, dtype=paddle_input_dtype, name="INPUT_0")
+        input_spec_y = InputSpec(input_shape, dtype=paddle_input_dtype, name="INPUT_1")
+        net = to_static(subAddModel, input_spec=[input_spec_x, input_spec_y])
+
+    model_version_dir = models_dir + "/" + model_name + "/" + str(model_version)
+
+    try:
+        os.makedirs(model_version_dir)
+    except OSError as ex:
+        pass  # ignore existing dir
+
+    paddle.jit.save(net, model_version_dir + "/model")
+
+
+def create_paddle_modelconfig(models_dir, max_batch, model_version,
+                              input_shape, output0_shape, output1_shape,
+                              input_dtype, output0_dtype, output1_dtype,
+                              output0_label_cnt, version_policy):
+
+    if not tu.validate_for_paddle_model(input_dtype, output0_dtype,
+                                        output1_dtype, input_shape,
+                                        output0_shape, output1_shape):
+        return
+
+    # Unpack version policy
+    version_policy_str = "{ latest { num_versions: 1 }}"
+    if version_policy is not None:
+        type, val = version_policy
+        if type == 'latest':
+            version_policy_str = "{{ latest {{ num_versions: {} }}}}".format(
+                val)
+        elif type == 'specific':
+            version_policy_str = "{{ specific {{ versions: {} }}}}".format(val)
+        else:
+            version_policy_str = "{ all { }}"
+
+    # Use a different model name for the non-batching variant
+    model_name = tu.get_model_name(
+        "paddle_nobatch" if max_batch == 0 else "paddle", input_dtype,
+        output0_dtype, output1_dtype)
+    config_dir = models_dir + "/" + model_name
+    config = '''
+name: "{}"
+backend: "paddle"
+max_batch_size: {}
+version_policy: {}
+input [
+  {{
+    name: "INPUT__0"
+    data_type: {}
+    dims: [ {} ]
+  }},
+  {{
+    name: "INPUT__1"
+    data_type: {}
+    dims: [ {} ]
+  }}
+]
+output [
+  {{
+    name: "OUTPUT__0"
+    data_type: {}
+    dims: [ {} ]
+    label_filename: "output0_labels.txt"
+  }},
+  {{
+    name: "OUTPUT__1"
+    data_type: {}
+    dims: [ {} ]
+  }}
+]
+'''.format(model_name, max_batch, version_policy_str,
+           np_to_model_dtype(input_dtype), tu.shape_to_dims_str(input_shape),
+           np_to_model_dtype(input_dtype), tu.shape_to_dims_str(input_shape),
+           np_to_model_dtype(output0_dtype),
+           tu.shape_to_dims_str(output0_shape),
+           np_to_model_dtype(output1_dtype),
+           tu.shape_to_dims_str(output1_shape))
+
+    try:
+        os.makedirs(config_dir)
+    except OSError as ex:
+        pass  # ignore existing dir
+
+    with open(config_dir + "/config.pbtxt", "w") as cfile:
+        cfile.write(config)
+
+    with open(config_dir + "/output0_labels.txt", "w") as lfile:
+        for l in range(output0_label_cnt):
+            lfile.write("label" + str(l) + "\n")
+
+
 def create_openvino_modelfile(models_dir,
                               max_batch,
                               model_version,
@@ -1579,6 +1741,24 @@ def create_models(models_dir,
                                   output0_shape, output1_shape, input_dtype,
                                   output0_dtype, output1_dtype)
 
+    if FLAGS.paddle:
+        # max-batch 8
+        create_paddle_modelconfig(models_dir, 8, model_version, input_shape,
+                                    output0_shape, output1_shape, input_dtype,
+                                    output0_dtype, output1_dtype,
+                                    output0_label_cnt, version_policy)
+        create_paddle_modelfile(models_dir, 8, model_version, input_shape,
+                                  output0_shape, output1_shape, input_dtype,
+                                  output0_dtype, output1_dtype)
+        # max-batch 0
+        create_paddle_modelconfig(models_dir, 0, model_version, input_shape,
+                                    output0_shape, output1_shape, input_dtype,
+                                    output0_dtype, output1_dtype,
+                                    output0_label_cnt, version_policy)
+        create_paddle_modelfile(models_dir, 0, model_version, input_shape,
+                                  output0_shape, output1_shape, input_dtype,
+                                  output0_dtype, output1_dtype)
+
     if FLAGS.openvino:
         # max-batch 8
         create_openvino_modelconfig(models_dir, 8, model_version, input_shape,
@@ -1683,6 +1863,10 @@ if __name__ == '__main__':
                         required=False,
                         action='store_true',
                         help='Generate Pytorch LibTorch models')
+    parser.add_argument('--paddle',
+                        required=False,
+                        action='store_true',
+                        help='Generate Paddle models')
     parser.add_argument('--openvino',
                         required=False,
                         action='store_true',
@@ -1701,7 +1885,7 @@ if __name__ == '__main__':
 
     if FLAGS.graphdef or FLAGS.savedmodel:
         import tensorflow as tf
-        from tensorflow.python.framework import graph_io, graph_util
+        from tensorflow.python.framework import graph_io
     if FLAGS.tensorrt:
         import tensorrt as trt
     if FLAGS.onnx:
@@ -1709,8 +1893,13 @@ if __name__ == '__main__':
     if FLAGS.libtorch:
         import torch
         from torch import nn
+    if FLAGS.paddle:
+        import paddle
+        from paddle import nn
+        from paddle.static import InputSpec
+        from paddle.jit import to_static
     if FLAGS.openvino:
-        from openvino.inference_engine import IECore, IENetwork
+        from openvino.inference_engine import IENetwork
         import ngraph as ng
 
     import test_util as tu
@@ -1910,6 +2099,7 @@ if __name__ == '__main__':
                                       vt,
                                       vt,
                                       swap=True)
+
         if FLAGS.libtorch:
             for vt in [np.float32, np.int32, np.int16, np.int8]:
                 create_libtorch_modelfile(FLAGS.models_dir,
@@ -1940,6 +2130,38 @@ if __name__ == '__main__':
                                           vt,
                                           vt,
                                           swap=True)
+
+        if FLAGS.paddle:
+            for vt in [np.float32, np.int32, np.int64]:
+                create_paddle_modelfile(FLAGS.models_dir,
+                                        8,
+                                        2, (16,), (16,), (16,),
+                                        vt,
+                                        vt,
+                                        vt,
+                                        swap=True)
+                create_paddle_modelfile(FLAGS.models_dir,
+                                        8,
+                                        3, (16,), (16,), (16,),
+                                        vt,
+                                        vt,
+                                        vt,
+                                        swap=True)
+                create_paddle_modelfile(FLAGS.models_dir,
+                                        0,
+                                        2, (16,), (16,), (16,),
+                                        vt,
+                                        vt,
+                                        vt,
+                                        swap=True)
+                create_paddle_modelfile(FLAGS.models_dir,
+                                        0,
+                                        3, (16,), (16,), (16,),
+                                        vt,
+                                        vt,
+                                        vt,
+                                        swap=True)
+
         if FLAGS.openvino:
             for vt in [np.float16, np.float32, np.int8, np.int16, np.int32]:
                 create_openvino_modelfile(FLAGS.models_dir,

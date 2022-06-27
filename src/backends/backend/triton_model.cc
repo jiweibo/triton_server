@@ -29,10 +29,13 @@
 #include <vector>
 #include "src/backends/backend/triton_backend_config.h"
 #include "src/backends/backend/triton_model_instance.h"
+#include "src/core/dynamic_batch_scheduler.h"
 #include "src/core/filesystem.h"
 #include "src/core/logging.h"
 #include "src/core/model_config_utils.h"
 #include "src/core/numa_utils.h"
+#include "src/core/sequence_batch_scheduler.h"
+#include "src/core/sequence_state.h"
 #include "src/core/server.h"
 #include "src/core/server_message.h"
 #include "src/core/shared_library.h"
@@ -135,20 +138,8 @@ TritonModel::Create(
 
   // Create and initialize the model.
   std::unique_ptr<TritonModel> local_model(new TritonModel(
-      server, localized_model_dir, backend, min_compute_capability,
-      auto_complete_config));
-  // If request for auto completion, Init() will be postponed until
-  // UpdateModelConfig() is called as Init() assumes the model config
-  // is well-formed.
-  // FIXME: the backend never calls SetModelConfig then Init will not be called,
-  // need to revisit this once all backends are moved over and we can get rid of
-  // the InferenceBackend class.
-  if (auto_complete_config) {
-    RETURN_IF_ERROR(local_model->SetModelConfig(version_path, model_config));
-  } else {
-    RETURN_IF_ERROR(
-        local_model->Init(version_path, model_config, "" /* platform */));
-  }
+      server, localized_model_dir, backend, min_compute_capability, version,
+      model_config, auto_complete_config));
 
   TritonModel* raw_local_model = local_model.get();
 
@@ -167,18 +158,27 @@ TritonModel::Create(
     RETURN_IF_ERROR(slib->ResetLibraryDirectory());
     RETURN_IF_TRITONSERVER_ERROR(err);
   }
-  local_model->initialized_ = true;
 
-  const bool device_blocking =
-      (local_model->backend_->ExecutionPolicy() ==
-       TRITONBACKEND_EXECUTION_DEVICE_BLOCKING);
+  // Initialize the model for Triton core usage
+  RETURN_IF_ERROR(local_model->Init());
+
+  bool device_blocking = false;
+  if (local_model->backend_->ExecutionPolicy() ==
+      TRITONBACKEND_EXECUTION_DEVICE_BLOCKING) {
+    if (model_config.has_sequence_batching()) {
+      LOG_INFO << "Overriding execution policy to "
+                  "\"TRITONBACKEND_EXECUTION_BLOCKING\" for sequence model \""
+               << model_config.name() << "\"";
+    } else {
+      device_blocking = true;
+    }
+  }
 
   // Create and initialize the model instances for this model.
   RETURN_IF_ERROR(TritonModelInstance::CreateInstances(
       raw_local_model, host_policy_map, model_config, device_blocking));
 
-  RETURN_IF_ERROR(
-      local_model->SetConfiguredScheduler(static_cast<void*>(raw_local_model)));
+  RETURN_IF_ERROR(local_model->SetConfiguredScheduler());
 
   *model = std::move(local_model);
   return Status::Success;
@@ -201,11 +201,6 @@ Status
 TritonModel::UpdateModelConfig(
     const uint32_t config_version, TRITONSERVER_Message* updated_config_message)
 {
-  if (initialized_) {
-    return Status(
-        Status::Code::INVALID_ARG,
-        "model config can not be set once model is initialized");
-  }
   const char* buffer;
   size_t byte_size;
   RETURN_IF_TRITONSERVER_ERROR(TRITONSERVER_MessageSerializeToJson(
@@ -221,10 +216,59 @@ TritonModel::UpdateModelConfig(
   auto outputs_config = config.mutable_output();
   *outputs_config = updated_config.output();
 
-  RETURN_IF_ERROR(Init(
-      JoinPath({LocalizedModelPath(), std::to_string(Version())}), config,
-      "" /* platform */));
+  RETURN_IF_ERROR(SetModelConfig(config));
   return Status::Success;
+}
+
+Status
+TritonModel::SetConfiguredScheduler()
+{
+  std::unique_ptr<Scheduler> scheduler;
+
+  // Need to enforce equal shape batches (i.e. non-ragged batches) if
+  // the model 1) allows one or more variable-size input tensors that
+  // are not marked as 'allow_ragged_batch' or 2) has one or more
+  // shape-tensor inputs. This is not needed if all input shapes are
+  // non-variable and if there are no shape tensors... so we don't
+  // enable it in that case for efficiency reasons.
+  std::unordered_map<std::string, bool> enforce_equal_shape_tensors;
+  for (const auto input : config_.input()) {
+    if (input.is_shape_tensor()) {
+      enforce_equal_shape_tensors.insert({input.name(), true});
+    } else if (!input.allow_ragged_batch() && (GetElementCount(input) == -1)) {
+      enforce_equal_shape_tensors.insert({input.name(), false});
+    }
+  }
+
+  // If 'sequence_batching' is configured, then use the SequenceBatchScheduler,
+  // otherwise use the default DynamicBatchScheduler.
+  if (config_.has_sequence_batching()) {
+    // Sequence batcher
+    RETURN_IF_ERROR(SequenceBatchScheduler::Create(
+        this, enforce_equal_shape_tensors, &scheduler));
+  } else if (config_.has_dynamic_batching()) {
+    // Dynamic batcher
+    RETURN_IF_ERROR(DynamicBatchScheduler::Create(
+        this, nullptr, 0 /*nice*/, true /* dynamic_batching_enabled */,
+        config_.max_batch_size(), enforce_equal_shape_tensors,
+        config_.dynamic_batching(),
+        config_.response_cache().enable() /* response_cache_enable */,
+        &scheduler));
+  } else {
+    // Default scheduler. Use dynamic batch scheduler (with batching
+    // disabled) as the default scheduler.
+    RETURN_IF_ERROR(DynamicBatchScheduler::Create(
+        this, nullptr, 0 /*nice*/, false /* dynamic_batching_enabled */,
+        1 /* max_batch_size */,
+        std::unordered_map<
+            std::string, bool>() /* enforce_equal_shape_tensors */,
+        false /* preserve_ordering */,
+        config_.response_cache().enable() /* response_cache_enable */,
+        std::set<int32_t>() /* preferred_batch_sizes */,
+        0 /* max_queue_delay_microseconds */, &scheduler));
+  }
+
+  return SetScheduler(std::move(scheduler));
 }
 
 Status
@@ -251,23 +295,18 @@ TritonModel::TritonModel(
     InferenceServer* server,
     const std::shared_ptr<LocalizedDirectory>& localized_model_dir,
     const std::shared_ptr<TritonBackend>& backend,
-    const double min_compute_capability, const bool auto_complete_config)
-    : InferenceBackend(min_compute_capability), server_(server),
-      auto_complete_config_(auto_complete_config),
+    const double min_compute_capability, const int64_t version,
+    const inference::ModelConfig& config, const bool auto_complete_config)
+    : Model(
+          min_compute_capability, localized_model_dir->Path(), version, config),
+      server_(server), auto_complete_config_(auto_complete_config),
       localized_model_dir_(localized_model_dir), backend_(backend),
-      state_(nullptr), initialized_(false)
+      state_(nullptr)
 {
 }
 
 TritonModel::~TritonModel()
 {
-  // Need to explicitly delete the scheduler from InferenceBackend
-  // base class to make sure that all scheduler threads have returned
-  // from running in the backend code... This convoluted flow will be
-  // cleaned up once legacy InferenceBackend is completed replaced by
-  // TritonModel.
-  scheduler_.reset();
-
   // Explicitly delete/finalize all model instances before finalizing
   // the model itself.
   instances_.clear();
@@ -577,12 +616,107 @@ TRITONBACKEND_RequestOutputName(
 }
 
 TRITONSERVER_Error*
+TRITONBACKEND_RequestOutputBufferProperties(
+    TRITONBACKEND_Request* request, const char* name, size_t* byte_size,
+    TRITONSERVER_MemoryType* memory_type, int64_t* memory_type_id)
+{
+  InferenceRequest* tr = reinterpret_cast<InferenceRequest*>(request);
+  auto status =
+      tr->OutputBufferProperties(name, byte_size, memory_type, memory_type_id);
+  if (!status.IsOk()) {
+    return TRITONSERVER_ErrorNew(
+        StatusCodeToTritonCode(status.StatusCode()), status.Message().c_str());
+  }
+  return nullptr;  // success
+}
+
+TRITONSERVER_Error*
 TRITONBACKEND_RequestRelease(
     TRITONBACKEND_Request* request, uint32_t release_flags)
 {
   InferenceRequest* tr = reinterpret_cast<InferenceRequest*>(request);
   std::unique_ptr<InferenceRequest> ur(tr);
   InferenceRequest::Release(std::move(ur), release_flags);
+  return nullptr;  // success
+}
+
+///
+/// TRITONBACKEND_State
+///
+
+TRITONSERVER_Error*
+TRITONBACKEND_StateUpdate(TRITONBACKEND_State* state)
+{
+  SequenceState* ts = reinterpret_cast<SequenceState*>(state);
+  auto status = ts->Update();
+
+  if (!status.IsOk()) {
+    return TRITONSERVER_ErrorNew(
+        StatusCodeToTritonCode(status.StatusCode()), status.Message().c_str());
+  }
+
+  return nullptr;  // success
+}
+
+TRITONSERVER_Error*
+TRITONBACKEND_StateNew(
+    TRITONBACKEND_State** state, TRITONBACKEND_Request* request,
+    const char* name, const TRITONSERVER_DataType datatype,
+    const int64_t* shape, const uint32_t dims_count)
+{
+  InferenceRequest* tr = reinterpret_cast<InferenceRequest*>(request);
+  SequenceState* lstate;
+  std::vector<int64_t> lshape(shape, shape + dims_count);
+  auto& sequence_state = tr->GetSequenceStates();
+
+  if (sequence_state == nullptr) {
+    return TRITONSERVER_ErrorNew(
+        TRITONSERVER_ERROR_INVALID_ARG,
+        (std::string("unable to add state '") + name +
+         "'. State configuration is missing for model '" + tr->ModelName() +
+         "'.")
+            .c_str());
+  }
+
+  Status status = sequence_state->OutputState(
+      name, TritonToDataType(datatype), lshape, &lstate);
+  if (!status.IsOk()) {
+    *state = nullptr;
+    return TRITONSERVER_ErrorNew(
+        StatusCodeToTritonCode(status.StatusCode()), status.Message().c_str());
+  }
+
+  *state = reinterpret_cast<TRITONBACKEND_State*>(lstate);
+  return nullptr;  // success
+}
+
+TRITONSERVER_Error*
+TRITONBACKEND_StateBuffer(
+    TRITONBACKEND_State* state, void** buffer, const uint64_t buffer_byte_size,
+    TRITONSERVER_MemoryType* memory_type, int64_t* memory_type_id)
+{
+  SequenceState* to = reinterpret_cast<SequenceState*>(state);
+  Status status = Status::Success;
+
+  // If the buffer size exactly matches the buffer available, reuse the
+  // currently allocated buffer.
+  if (to->Data()->TotalByteSize() == buffer_byte_size) {
+    const std::shared_ptr<AllocatedMemory>& memory =
+        reinterpret_cast<const std::shared_ptr<AllocatedMemory>&>(to->Data());
+    *buffer = memory->MutableBuffer(memory_type, memory_type_id);
+  } else {
+    std::shared_ptr<AllocatedMemory> memory = std::make_shared<AllocatedMemory>(
+        buffer_byte_size, *memory_type, *memory_type_id);
+    *buffer = memory->MutableBuffer(memory_type, memory_type_id);
+    to->RemoveAllData();
+    status = to->SetData(memory);
+  }
+
+  if (!status.IsOk()) {
+    *buffer = nullptr;
+    return TRITONSERVER_ErrorNew(
+        StatusCodeToTritonCode(status.StatusCode()), status.Message().c_str());
+  }
   return nullptr;  // success
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -30,7 +30,6 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
-import base64
 import glob
 import os
 import sys
@@ -39,7 +38,7 @@ import tarfile
 
 def send(subject: str,
          content: str,
-         attachments=[],
+         attachments=None,
          files_to_tar=None,
          is_html=False):
     FROM = os.environ.get('TRITON_FROM', '')
@@ -57,6 +56,9 @@ def send(subject: str,
     else:
         mime_text = MIMEText(content)
     msg.attach(mime_text)
+
+    if attachments is None:
+        attachments = []
 
     if files_to_tar is not None:
         with tarfile.open(subject + ".tgz", "w:gz") as csv_tar:

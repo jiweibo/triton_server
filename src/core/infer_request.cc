@@ -28,8 +28,8 @@
 
 #include <algorithm>
 #include <deque>
-#include "src/core/backend.h"
 #include "src/core/logging.h"
+#include "src/core/model.h"
 #include "src/core/server.h"
 
 namespace nvidia { namespace inferenceserver {
@@ -91,29 +91,48 @@ NullRequestComplete(
 const std::string&
 InferenceRequest::ModelName() const
 {
-  return backend_raw_->Name();
+  return model_raw_->Name();
 }
 
 int64_t
 InferenceRequest::ActualModelVersion() const
 {
-  return backend_raw_->Version();
+  return model_raw_->Version();
 }
 
 void
 InferenceRequest::SetPriority(uint32_t p)
 {
-  if ((p == 0) || (p > backend_raw_->MaxPriorityLevel())) {
-    priority_ = backend_raw_->DefaultPriorityLevel();
+  if ((p == 0) || (p > model_raw_->MaxPriorityLevel())) {
+    priority_ = model_raw_->DefaultPriorityLevel();
   } else {
     priority_ = p;
   }
 }
 
 Status
+InferenceRequest::OutputBufferProperties(
+    const char* name, size_t* byte_size, TRITONSERVER_MemoryType* memory_type,
+    int64_t* memory_type_id)
+{
+  const auto allocator = response_factory_.Allocator();
+  if ((allocator == nullptr) || (allocator->QueryFn() == nullptr)) {
+    return Status(
+        Status::Code::UNAVAILABLE, "Output properties are not available");
+  } else {
+    RETURN_IF_TRITONSERVER_ERROR(allocator->QueryFn()(
+        reinterpret_cast<TRITONSERVER_ResponseAllocator*>(
+            const_cast<ResponseAllocator*>(allocator)),
+        response_factory_.AllocatorUserp(), name, byte_size, memory_type,
+        memory_type_id));
+  }
+  return Status::Success;
+}
+
+Status
 InferenceRequest::Run(std::unique_ptr<InferenceRequest>& request)
 {
-  return request->backend_raw_->Enqueue(request);
+  return request->model_raw_->Enqueue(request);
 }
 
 void
@@ -198,7 +217,7 @@ InferenceRequest::CopyAsNull(const InferenceRequest& from)
   // outputs. Maybe more efficient to share inputs and other metadata,
   // but that binds the Null request with 'from' request's lifecycle.
   std::unique_ptr<InferenceRequest> lrequest(
-      new InferenceRequest(from.backend_raw_, from.requested_model_version_));
+      new InferenceRequest(from.model_raw_, from.requested_model_version_));
   lrequest->needs_normalization_ = false;
   lrequest->batch_size_ = from.batch_size_;
   lrequest->collect_stats_ = false;
@@ -478,6 +497,29 @@ InferenceRequest::AddOriginalRequestedOutput(const std::string& name)
 }
 
 Status
+InferenceRequest::LoadInputStates()
+{
+  // Add the input states to the inference request.
+  if (sequence_states_ != nullptr) {
+    if (sequence_states_->IsNullRequest()) {
+      sequence_states_ =
+          SequenceStates::CopyAsNull(sequence_states_->NullSequenceStates());
+    }
+    for (auto& input_state_pair : sequence_states_->InputStates()) {
+      auto& input_state = input_state_pair.second;
+      std::shared_ptr<InferenceRequest::Input> input =
+          std::make_shared<InferenceRequest::Input>(
+              input_state->Name(), input_state->DType(), input_state->Shape());
+      *input->MutableShapeWithBatchDim() = input_state->Shape();
+      input->SetData(input_state->Data());
+      AddOverrideInput(input);
+    }
+  }
+
+  return Status::Success;
+}
+
+Status
 InferenceRequest::RemoveOriginalRequestedOutput(const std::string& name)
 {
   original_requested_outputs_.erase(name);
@@ -529,7 +571,7 @@ InferenceRequest::PrepareForInference()
 Status
 InferenceRequest::Normalize()
 {
-  const inference::ModelConfig& model_config = backend_raw_->Config();
+  const inference::ModelConfig& model_config = model_raw_->Config();
 
   // Initialize the requested outputs to be used during inference. If
   // original_requested_outputs_ is empty assume all outputs specified
@@ -544,18 +586,30 @@ InferenceRequest::Normalize()
     // model configuration.
     for (const auto& output_name : original_requested_outputs_) {
       const inference::ModelOutput* output_config;
-      RETURN_IF_ERROR(backend_raw_->GetOutput(output_name, &output_config));
+      RETURN_IF_ERROR(model_raw_->GetOutput(output_name, &output_config));
     }
   }
-
-  // Make sure that the request is providing the same number of inputs
+  // Make sure that the request is providing the number of inputs
   // as is expected by the model.
-  if (original_inputs_.size() != (size_t)model_config.input_size()) {
-    return Status(
-        Status::Code::INVALID_ARG,
-        "expected " + std::to_string(model_config.input_size()) +
-            " inputs but got " + std::to_string(original_inputs_.size()) +
-            " inputs for model '" + ModelName() + "'");
+  if ((original_inputs_.size() > (size_t)model_config.input_size()) ||
+      (original_inputs_.size() < model_raw_->RequiredInputCount())) {
+    // If no input is marked as optional, then use exact match error message
+    // for consistency / backward compatibility
+    if ((size_t)model_config.input_size() == model_raw_->RequiredInputCount()) {
+      return Status(
+          Status::Code::INVALID_ARG,
+          "expected " + std::to_string(model_config.input_size()) +
+              " inputs but got " + std::to_string(original_inputs_.size()) +
+              " inputs for model '" + ModelName() + "'");
+    } else {
+      return Status(
+          Status::Code::INVALID_ARG,
+          "expected number of inputs between " +
+              std::to_string(model_raw_->RequiredInputCount()) + " and " +
+              std::to_string(model_config.input_size()) + " but got " +
+              std::to_string(original_inputs_.size()) + " inputs for model '" +
+              ModelName() + "'");
+    }
   }
 
   // Determine the batch size and shape of each input.
@@ -579,7 +633,7 @@ InferenceRequest::Normalize()
       // For a shape tensor, keep the tensor's shape as it is and mark
       // that the input is a shape tensor.
       const inference::ModelInput* input_config;
-      RETURN_IF_ERROR(backend_raw_->GetInput(pr.first, &input_config));
+      RETURN_IF_ERROR(model_raw_->GetInput(pr.first, &input_config));
       if (input_config->is_shape_tensor()) {
         *input.MutableShape() = input.OriginalShape();
         input.SetIsShapeTensor(true);
@@ -623,7 +677,7 @@ InferenceRequest::Normalize()
   // adjustments for reshapes and find the total tensor size.
   for (auto& pr : original_inputs_) {
     const inference::ModelInput* input_config;
-    RETURN_IF_ERROR(backend_raw_->GetInput(pr.first, &input_config));
+    RETURN_IF_ERROR(model_raw_->GetInput(pr.first, &input_config));
 
     auto& input = pr.second;
     auto shape = input.MutableShape();
@@ -638,19 +692,44 @@ InferenceRequest::Normalize()
               "' for '" + ModelName() + "'");
     }
 
-    if (!CompareDimsWithWildcard(input_config->dims(), *shape)) {
-      DimsList full_dims;
-      if (model_config.max_batch_size() > 0) {
-        full_dims.Add(WILDCARD_DIM);
+    // Validate input shape
+    {
+      bool match_config = true;
+      const auto& config_dims = input_config->dims();
+      const auto& input_dims = *shape;
+      if (config_dims.size() != (int64_t)input_dims.size()) {
+        match_config = false;
+      } else {
+        for (int i = 0; i < config_dims.size(); ++i) {
+          if (input_dims[i] == WILDCARD_DIM) {
+            return Status(
+                Status::Code::INVALID_ARG,
+                "All input dimensions should be specified for input '" +
+                    pr.first + "' for model '" + ModelName() + "', got " +
+                    DimsListToString(input.OriginalShape()));
+          } else if (
+              (config_dims[i] != WILDCARD_DIM) &&
+              (config_dims[i] != input_dims[i])) {
+            match_config = false;
+            break;
+          }
+        }
       }
-      for (int i = 0; i < input_config->dims_size(); ++i) {
-        full_dims.Add(input_config->dims(i));
+
+      if (!match_config) {
+        DimsList full_dims;
+        if (model_config.max_batch_size() > 0) {
+          full_dims.Add(WILDCARD_DIM);
+        }
+        for (int i = 0; i < input_config->dims_size(); ++i) {
+          full_dims.Add(input_config->dims(i));
+        }
+        return Status(
+            Status::Code::INVALID_ARG,
+            "unexpected shape for input '" + pr.first + "' for model '" +
+                ModelName() + "'. Expected " + DimsListToString(full_dims) +
+                ", got " + DimsListToString(input.OriginalShape()));
       }
-      return Status(
-          Status::Code::INVALID_ARG,
-          "unexpected shape for input '" + pr.first + "' for model '" +
-              ModelName() + "'. Expected " + DimsListToString(full_dims) +
-              ", got " + DimsListToString(input.OriginalShape()));
     }
 
     // If there is a reshape for this input then adjust them to
@@ -716,7 +795,7 @@ InferenceRequest::ReportStatistics(
   INFER_STATS_DECL_TIMESTAMP(request_end_ns);
 
   if (success) {
-    backend_raw_->MutableStatsAggregator()->UpdateSuccess(
+    model_raw_->MutableStatsAggregator()->UpdateSuccess(
         metric_reporter, std::max(1U, batch_size_), request_start_ns_,
         queue_start_ns_, compute_start_ns, compute_input_end_ns,
         compute_output_start_ns, compute_end_ns, request_end_ns);
@@ -728,7 +807,7 @@ InferenceRequest::ReportStatistics(
           request_end_ns);
     }
   } else {
-    backend_raw_->MutableStatsAggregator()->UpdateFailure(
+    model_raw_->MutableStatsAggregator()->UpdateFailure(
         metric_reporter, request_start_ns_, request_end_ns);
     if (secondary_stats_aggregator_ != nullptr) {
       secondary_stats_aggregator_->UpdateFailure(
@@ -751,7 +830,7 @@ InferenceRequest::ReportStatisticsWithDuration(
   INFER_STATS_DECL_TIMESTAMP(request_end_ns);
 
   if (success) {
-    backend_raw_->MutableStatsAggregator()->UpdateSuccessWithDuration(
+    model_raw_->MutableStatsAggregator()->UpdateSuccessWithDuration(
         metric_reporter, std::max(1U, batch_size_), request_start_ns_,
         queue_start_ns_, compute_start_ns, request_end_ns,
         compute_input_duration_ns, compute_infer_duration_ns,
@@ -764,7 +843,7 @@ InferenceRequest::ReportStatisticsWithDuration(
           compute_output_duration_ns);
     }
   } else {
-    backend_raw_->MutableStatsAggregator()->UpdateFailure(
+    model_raw_->MutableStatsAggregator()->UpdateFailure(
         metric_reporter, request_start_ns_, request_end_ns);
     if (secondary_stats_aggregator_ != nullptr) {
       secondary_stats_aggregator_->UpdateFailure(
